@@ -67,6 +67,7 @@ class Scheduler:
         self.cueq = cueq
         self.molecule_single = molecule_single
         self.bfgs_cpu_thread = bfgs_cpu_thread
+        self.extra_kwargs = kwargs
 
         ensure_directory(self.output_path)
 
@@ -106,6 +107,7 @@ class Scheduler:
                 "use_fasteq": self.use_fasteq,
                 "cueq": self.cueq,
                 "bfgs_cpu_thread": self.bfgs_cpu_thread,
+                **self.extra_kwargs,
             }
 
             p = mp.Process(target=_worker_process_target, args=(worker_kwargs,))
