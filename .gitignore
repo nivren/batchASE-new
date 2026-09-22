@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/C++ / CUDA build artifacts
+*.so
+*.o
+*.a
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments & IDE
+.venv/
+env/
+venv/
+.idea/
+.vscode/
+*.swp
+
+# Testing & caching
+.pytest_cache/
+.coverage
+htmlcov/
