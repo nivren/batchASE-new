@@ -56,7 +56,9 @@ def parse_args():
     parser.add_argument("--bind_cores", type=str, default=None, help="Core ranges for each worker")
     parser.add_argument("--compile_mode", type=str, default=None, help="torch.compile mode")
     parser.add_argument("--profile", type=str, default="False", help="Enable profiling options")
-    parser.add_argument("--run_baseline", type=str2bool, nargs="?", const=True, default=False, help="Run baseline sequential ASE")
+    parser.add_argument("--num_structures", type=int, default=0, help="Number of structures to optimize (0 = all)")
+    parser.add_argument("--structure_select", type=str, default="seq", help="Structure selection mode when num_structures > 0: 'seq', 'ran', 'max', 'min'")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for 'ran' selection mode")
     parser.add_argument("--log_level", type=lambda s: s.upper(), default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     return parser.parse_args()
 
@@ -75,24 +77,48 @@ def main():
     )
 
     target_folder = pathlib.Path(args.target_folder)
-    files = [str(f) for f in target_folder.glob("*.cif")]
+    files = sorted([str(f) for f in target_folder.glob("*.cif")])
     if not files:
         logging.error(f"No CIF files found in {target_folder}")
         return
+
+    total_found = len(files)
+    if args.num_structures and args.num_structures > 0 and args.num_structures < total_found:
+        mode = args.structure_select.lower()
+        if mode in ("ran", "rand", "random"):
+            import random
+            rng = random.Random(args.random_seed)
+            files = sorted(rng.sample(files, args.num_structures))
+            select_mode = "ran"
+        elif mode in ("max", "largest"):
+            t0 = time.perf_counter()
+            files = sorted(files, key=count_atoms_cif, reverse=True)[:args.num_structures]
+            logging.info(f"Selected top {len(files)} largest structures in {time.perf_counter() - t0:.3f}s")
+            select_mode = "max"
+        elif mode in ("min", "smallest"):
+            t0 = time.perf_counter()
+            files = sorted(files, key=count_atoms_cif, reverse=False)[:args.num_structures]
+            logging.info(f"Selected top {len(files)} smallest structures in {time.perf_counter() - t0:.3f}s")
+            select_mode = "min"
+        else:
+            files = files[:args.num_structures]
+            select_mode = "seq"
+        logging.info(f"batchASE: Selected {len(files)} / {total_found} structures (mode='{select_mode}', seed={args.random_seed})")
+    else:
+        logging.info(f"batchASE: Found {len(files)} files in {target_folder}")
 
     output_path = os.path.abspath(args.output_path)
     ensure_directory(output_path)
 
     devices = [f"cuda:{i}" for i in range(args.gpu_offset, args.gpu_offset + args.n_gpus)]
 
-    logging.info(f"batchASE: Found {len(files)} files in {target_folder}")
     logging.info(f"Target devices: {devices}, Workers: {args.num_workers}, Batch size: {args.batch_size}")
     logging.info(f"Optimizers: Stage1={args.optimizer1} (filter={args.filter1}), Stage2={args.optimizer2} (filter={args.filter2})")
 
     with open(os.path.join(output_path, "manifest.txt"), "w") as f:
         f.write("\n".join(files) + "\n")
 
-    if args.use_ordered_files:
+    if args.use_ordered_files and not (args.num_structures > 0 and args.structure_select.lower() in ("max", "largest")):
         logging.info("Sorting structures by atom count (descending)...")
         t0 = time.perf_counter()
         files = sorted(files, key=count_atoms_cif, reverse=True)
