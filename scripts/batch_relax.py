@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument("--compile_mode", type=str, default=None, help="torch.compile mode")
     parser.add_argument("--profile", type=str, default="False", help="Enable profiling options")
     parser.add_argument("--run_baseline", type=str2bool, nargs="?", const=True, default=False, help="Run baseline sequential ASE")
-    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
+    parser.add_argument("--log_level", type=lambda s: s.upper(), default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     return parser.parse_args()
 
 
