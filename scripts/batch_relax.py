@@ -59,6 +59,7 @@ def parse_args():
     parser.add_argument("--num_structures", type=int, default=0, help="Number of structures to optimize (0 = all)")
     parser.add_argument("--structure_select", type=str, default="seq", help="Structure selection mode when num_structures > 0: 'seq', 'ran', 'max', 'min'")
     parser.add_argument("--random_seed", type=int, default=42, help="Random seed for 'ran' selection mode")
+    parser.add_argument("--run_baseline", type=str2bool, nargs="?", const=True, default=False, help="Run baseline sequential ASE")
     parser.add_argument("--log_level", type=lambda s: s.upper(), default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     return parser.parse_args()
 
