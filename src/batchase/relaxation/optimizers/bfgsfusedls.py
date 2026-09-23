@@ -28,7 +28,7 @@ class BFGSFusedLS:
         c2: float = 0.46,
         alpha: float = 10.0,
         stpmax: float = 50.0,
-        device = 'cpu', 
+        device = None, 
         early_stop: bool = False,
         use_profiler: bool = False,
         profiler_log_dir: str = './log',
@@ -42,7 +42,7 @@ class BFGSFusedLS:
         self.alpha = alpha
         self.stpmax = stpmax
         self.nsteps = 0
-        self.device = device
+        self.device = device if device is not None else optimizable_batch.device
         self.force_calls = 0
         self.early_stop = early_stop
         self.use_profiler = use_profiler
@@ -984,7 +984,7 @@ class LineSearchBatch:
                 ls = self.linesearch_list[i]
                 if ls.fc > max_iter:
                     completed[i] = True
-                    logging.warning(f"LineSearchBatch[{i}] reached max_iter: {max_iter}")
+                    logging.debug(f"LineSearchBatch[{i}] reached max_iter: {max_iter}")
                     continue
                 stp = ls.step(self.steps[i], self.phi0_values[i], self.derphi0_values[i], 
                                 c1, c2, ls.xtol, ls.isave, ls.dsave)

@@ -37,13 +37,13 @@ class _DummyCalculator:
 try:
     from mace.calculators import MACECalculator
 except ImportError:
-    logging.warning("Unable to import MACECalculator.")
+    logging.debug("Unable to import MACECalculator.")
     MACECalculator = _DummyCalculator
 
 try:
     from chgnet.model.dynamics import CHGNetCalculator
 except ImportError:
-    logging.warning("Unable to import CHGNetCalculator.")
+    logging.debug("Unable to import CHGNetCalculator.")
     CHGNetCalculator = _DummyCalculator
 
 try:
@@ -53,7 +53,7 @@ try:
         D3Calculator,
     )
 except ImportError:
-    logging.warning("Unable to import SevenNetCalculator.")
+    logging.debug("Unable to import SevenNetCalculator.")
     SevenNetCalculator = _DummyCalculator
     SevenNetD3Calculator = _DummyCalculator
     D3Calculator = _DummyCalculator
@@ -61,7 +61,7 @@ except ImportError:
 try:
     from fairchem.core import pretrained_mlip, FAIRChemCalculator
 except ImportError:
-    logging.warning("Unable to import FAIRChemCalculator.")
+    logging.debug("Unable to import FAIRChemCalculator.")
     FAIRChemCalculator = _DummyCalculator
 
 
@@ -176,7 +176,6 @@ class OptimizableBatch(Optimizable):
         self.numpy = numpy
         self.mask_converged = mask_converged
         self._cached_batch = None
-        self._dirty: bool = True
         self._update_mask = None
         self.torch_results = {}
         self.results = {}
@@ -195,7 +194,7 @@ class OptimizableBatch(Optimizable):
         self._calculator_type = (
             backend.kind if backend is not None else self._determine_calculator_type()
         )
-        logging.info(
+        logging.debug(
             f"OptimizableBatch initialized with calculator type: {self._calculator_type}"
         )
 
@@ -266,17 +265,18 @@ class OptimizableBatch(Optimizable):
         return len(torch.unique(self.batch_indices))
 
     def check_state(self, batch: Batch, tol: float = 1e-12) -> list[str]:
-        """Check for any system changes since last calculation without GPU sync."""
-        if self._dirty or self._cached_batch is None:
-            return ["pos", "cell"]
-        return []
+        """Check for any system changes since last calculation."""
+        return compare_batches(
+            self._cached_batch,
+            batch,
+            tol=tol,
+            excluded_properties=set(self.ignored_changes),
+        )
 
     def _predict(self) -> None:
         """Run prediction if batch has any changes."""
-        if not self._dirty and self._cached_batch is not None:
-            return
-
-        if True:
+        system_changes = self.check_state(self.batch)
+        if len(system_changes) > 0:
             if self.backend is not None:
                 # v0.5.0 统一适配层路径：backend 自行构图并调 model.forward(dict)
                 self.torch_results = self.backend.predict(
@@ -339,7 +339,6 @@ class OptimizableBatch(Optimizable):
             self._cached_batch = SimpleNamespace(
                 **{prop: self.batch[prop].clone() for prop in changes}
             )
-            self._dirty = False
 
     def get_property(
         self, name, no_numpy: bool = False
@@ -392,7 +391,6 @@ class OptimizableBatch(Optimizable):
 
         if not self.otf_graph:
             self.update_graph()
-        self._dirty = True
 
     def get_forces(
         self, apply_constraint: bool = False, no_numpy: bool = False
@@ -421,7 +419,10 @@ class OptimizableBatch(Optimizable):
 
     def get_potential_energies(self) -> torch.Tensor | NDArray:
         """Get the predicted energy for each system in batch."""
-        return self.get_property("energy")
+        energies = self.get_property("energy")
+        if hasattr(energies, "view"):
+            return energies.view(-1)
+        return energies
 
     def get_cells(self) -> torch.Tensor:
         """Get batch crystallographic cells."""
@@ -457,7 +458,6 @@ class OptimizableBatch(Optimizable):
                     torch.from_numpy(M).to(self.device).reshape(-1, 3),
                 )
         self.batch.cell[self.update_mask] = cells[self.update_mask]
-        self._dirty = True
 
     def get_volumes(self) -> torch.Tensor:
         """Get a tensor of volumes for each cell in batch"""

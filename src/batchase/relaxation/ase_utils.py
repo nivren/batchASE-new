@@ -87,7 +87,7 @@ def batch_to_atoms(
             calc = SinglePointCalculator(
                 atoms=atoms, **{key: val[idx] for key, val in results.items()}
             )
-            atoms.set_calculator(calc)
+            atoms.calc = calc
 
         atoms_objects.append(atoms)
 

@@ -10,8 +10,14 @@ import logging
 import os
 import pathlib
 import time
+import warnings
 
-from batchase import Scheduler, ensure_directory, count_atoms_cif
+# Suppress known harmless upstream library warnings
+warnings.filterwarnings("ignore", message=".*Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*")
+warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="e3nn")
+
+from batchase import Scheduler, ensure_directory, count_atoms_cif, run_baseline
 
 
 def str2bool(v):
@@ -94,6 +100,26 @@ def main():
 
     filter1 = None if args.filter1 in ("none", None, "None") else args.filter1
     filter2 = None if args.filter2 in ("none", None, "None") else args.filter2
+
+    if args.run_baseline:
+        logging.info("Running baseline sequential ASE optimization...")
+        run_baseline(
+            files=files,
+            num_workers=args.num_workers,
+            devices=devices,
+            max_steps=args.max_steps,
+            filter1=filter1,
+            filter2=filter2,
+            skip_second_stage=args.skip_second_stage,
+            scalar_pressure=args.scalar_pressure,
+            optimizer1=args.optimizer1,
+            optimizer2=args.optimizer2,
+            fmax=args.fmax,
+            output_path=output_path,
+            model=args.model,
+        )
+        logging.info("Baseline relaxation completed.")
+        return
 
     scheduler = Scheduler(
         files=files,

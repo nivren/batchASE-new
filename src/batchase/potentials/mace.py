@@ -5,6 +5,7 @@ MACE batch inference potential adapter for batchASE.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Sequence
 import numpy as np
 import torch
@@ -80,7 +81,8 @@ class MACEBatchBackend:
 
         if calculator is None:
             from mace.calculators import mace_off
-            _mace_dev = str(device).split(":")[0] if str(device).startswith("cuda") else device
+            # Device passed to mace_off must be "cuda" without index for conv_fusion=(device=="cuda")
+            _mace_dev = str(device).split(":")[0] if str(device).startswith("cuda") else str(device)
             calculator = mace_off(
                 model=model,
                 device=_mace_dev,
@@ -96,6 +98,9 @@ class MACEBatchBackend:
         if r_max is None:
             raise RuntimeError("Model does not contain 'r_max' buffer.")
         self.r_max = float(r_max)
+        self.mace_time: float = 0.0
+        self.graph_time: float = 0.0
+        self.forward_calls: int = 0
 
         logger.info(
             "MACEBatchBackend initialized: device=%s dtype=%s r_max=%.2f neighbor=%s enable_cueq=%s use_fasteq=%s",
@@ -204,7 +209,23 @@ class MACEBatchBackend:
         return results
 
     def predict(self, gbatch, compute_stress: bool = False) -> dict:
-        return self._forward(self.build_inputs(gbatch), compute_stress)
+        t0 = time.perf_counter()
+        inputs = self.build_inputs(gbatch)
+        t1 = time.perf_counter()
+        results = self._forward(inputs, compute_stress)
+        t2 = time.perf_counter()
+        self.graph_time += (t1 - t0)
+        self.mace_time += (t2 - t1)
+        self.forward_calls += 1
+        return results
 
     def predict_from_atoms(self, atoms_list: Sequence, compute_stress: bool = False) -> dict:
-        return self._forward(self.build_inputs_from_atoms(atoms_list), compute_stress)
+        t0 = time.perf_counter()
+        inputs = self.build_inputs_from_atoms(atoms_list)
+        t1 = time.perf_counter()
+        results = self._forward(inputs, compute_stress)
+        t2 = time.perf_counter()
+        self.graph_time += (t1 - t0)
+        self.mace_time += (t2 - t1)
+        self.forward_calls += 1
+        return results

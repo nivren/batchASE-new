@@ -13,6 +13,7 @@ from .lbfgs import LBFGS
 _OPTIMIZERS: dict[str, Type] = {
     "bfgs": BFGS,
     "bfgsfusedls": BFGSFusedLS,
+    "bfgslinesearch": BFGSFusedLS,
     "lbfgs": LBFGS,
     "quasinewton": BFGS,
 }
