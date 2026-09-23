@@ -1,0 +1,17 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+    "torch",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pbc_graph_outer_cuda"
+version = "0.1.0"
+description = "CUDA-accelerated PBC graph operations for batchASE"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+py-modules = []
