@@ -39,6 +39,8 @@ class Worker:
         batch_size: int = 4,
         max_steps: int = 100,
         fmax: float = 0.01,
+        fmax1: Optional[float] = None,
+        fmax2: Optional[float] = None,
         filter1: Optional[str] = None,
         filter2: Optional[str] = None,
         optimizer1: str = "BFGSFusedLS",
@@ -69,6 +71,8 @@ class Worker:
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.fmax = fmax
+        self.fmax1 = fmax1 if fmax1 is not None else fmax
+        self.fmax2 = fmax2 if fmax2 is not None else fmax
         self.filter1 = filter1
         self.filter2 = filter2
         self.optimizer1 = optimizer1
@@ -111,10 +115,12 @@ class Worker:
         scalar_pressure: float,
         backend,
         a2g: AtomsToGraphs,
+        fmax: Optional[float] = None,
     ) -> tuple[List[str], Dict[str, Any]]:
         """Execute one complete relaxation stage with true continuous batch replenishment."""
+        stage_fmax = fmax if fmax is not None else self.fmax
         logger.info(
-            f"{self.worker_tag} Starting {stage_name} on {len(files)} files with {optimizer_name} (filter={filter_type})."
+            f"{self.worker_tag} Starting {stage_name} on {len(files)} files with {optimizer_name} (filter={filter_type}, fmax={stage_fmax})."
         )
         cif_dir = ensure_directory(os.path.join(self.output_path, f"cif_result_{stage_name}"))
         json_dir = ensure_directory(os.path.join(self.output_path, f"json_result_{stage_name}"))
@@ -271,14 +277,14 @@ class Worker:
             t_burst_start = time.perf_counter()
             if len(all_indices) > 0 and hasattr(batch_optimizer, "restart_from_earlystop"):
                 converge_indices = batch_optimizer.run(
-                    self.fmax,
+                    stage_fmax,
                     remaining_steps,
                     is_restart_earlystop=True,
                     restart_indices=restart_indices,
                     old_batch_indices=old_batch_indices,
                 )
             else:
-                converge_indices = batch_optimizer.run(self.fmax, remaining_steps)
+                converge_indices = batch_optimizer.run(stage_fmax, remaining_steps)
             t_burst_end = time.perf_counter()
             burst_duration = t_burst_end - t_burst_start
             total_burst_time += burst_duration
@@ -450,6 +456,7 @@ class Worker:
             scalar_pressure=self.scalar_pressure,
             backend=backend,
             a2g=a2g,
+            fmax=self.fmax1,
         )
 
         stages_dict = {"press": s1_metrics}
@@ -464,6 +471,7 @@ class Worker:
                 scalar_pressure=0.0,
                 backend=backend,
                 a2g=a2g,
+                fmax=self.fmax2,
             )
             stages_dict["final"] = s2_metrics
 

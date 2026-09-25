@@ -60,6 +60,8 @@ class Scheduler:
         batch_size: int = 4,
         max_steps: int = 100,
         fmax: float = 0.01,
+        fmax1: Optional[float] = None,
+        fmax2: Optional[float] = None,
         filter1: Optional[str] = "UnitCellFilter",
         filter2: Optional[str] = None,
         optimizer1: str = "BFGSFusedLS",
@@ -80,6 +82,8 @@ class Scheduler:
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.fmax = fmax
+        self.fmax1 = fmax1 if fmax1 is not None else fmax
+        self.fmax2 = fmax2 if fmax2 is not None else fmax
         self.filter1 = filter1
         self.filter2 = filter2
         self.optimizer1 = optimizer1
@@ -175,6 +179,8 @@ class Scheduler:
                 "batch_size": self.batch_size,
                 "max_steps": self.max_steps,
                 "fmax": self.fmax,
+                "fmax1": self.fmax1,
+                "fmax2": self.fmax2,
                 "filter1": self.filter1,
                 "filter2": self.filter2,
                 "optimizer1": self.optimizer1,

@@ -10,6 +10,8 @@ from .optimizers import (
     BFGS,
     BFGSFusedLS,
     LBFGS,
+    FIRE,
+    FIRE2,
     get_optimizer_cls,
     register_optimizer,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "BFGS",
     "BFGSFusedLS",
     "LBFGS",
+    "FIRE",
+    "FIRE2",
     "get_optimizer_cls",
     "register_optimizer",
 ]

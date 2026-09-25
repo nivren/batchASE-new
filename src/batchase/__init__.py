@@ -21,6 +21,8 @@ from .relaxation import (
     BFGS,
     BFGSFusedLS,
     LBFGS,
+    FIRE,
+    FIRE2,
     get_optimizer_cls,
     register_optimizer,
 )
@@ -28,7 +30,7 @@ from .engine import SlotManager, Worker, Scheduler
 from .baseline import run_baseline
 from .utils import count_atoms_cif, data_list_collater, ensure_directory
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "AtomsToGraphs",
@@ -44,6 +46,8 @@ __all__ = [
     "BFGS",
     "BFGSFusedLS",
     "LBFGS",
+    "FIRE",
+    "FIRE2",
     "get_optimizer_cls",
     "register_optimizer",
     "SlotManager",

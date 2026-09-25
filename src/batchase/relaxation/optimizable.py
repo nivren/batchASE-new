@@ -608,7 +608,8 @@ class OptimizableUnitCellBatch(OptimizableBatch):
                 used with optimizers that do require a line minimisation
                 (e.g. FIRE).
             scalar_pressure:
-                Applied pressure to use for enthalpy pV term. As above, this
+                Applied external hydrostatic pressure in eV/A^3 for enthalpy pV term
+                (e.g., 0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar). As above, this
                 breaks energy/force consistency.
             masked_eps: masking systems that are converged when using ASE optimizers results in divisions by zero
                 from zero differences in masked positions at future steps, we add a small number to prevent this.
@@ -864,7 +865,8 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
                 relaxations at constant volume, e.g. for mapping out an
                 energy-volume curve.
             scalar_pressure:
-                Applied pressure to use for enthalpy pV term. As above, this
+                Applied external hydrostatic pressure in eV/A^3 for enthalpy pV term
+                (e.g., 0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar). As above, this
                 breaks energy/force consistency.
             masked_eps: masking systems that are converged when using ASE optimizers results in divisions by zero
                 from zero differences in masked positions at future steps, we add a small number to prevent this.

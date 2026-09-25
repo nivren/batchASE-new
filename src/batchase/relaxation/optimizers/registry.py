@@ -9,6 +9,7 @@ from .base import BatchOptimizer
 from .bfgs import BFGS
 from .bfgsfusedls import BFGSFusedLS
 from .lbfgs import LBFGS
+from .fire import FIRE, FIRE2
 
 _OPTIMIZERS: dict[str, Type] = {
     "bfgs": BFGS,
@@ -16,6 +17,10 @@ _OPTIMIZERS: dict[str, Type] = {
     "bfgslinesearch": BFGSFusedLS,
     "lbfgs": LBFGS,
     "quasinewton": BFGS,
+    "fire": FIRE,
+    "fire2": FIRE2,
+    "batchfire": FIRE,
+    "batchfire2": FIRE2,
 }
 
 

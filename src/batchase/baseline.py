@@ -15,6 +15,8 @@ from ase.io import read
 from ase.optimize import LBFGS as ASE_LBFGS
 from ase.optimize import QuasiNewton as ASE_QuasiNewton
 from ase.optimize import BFGS as ASE_BFGS
+from ase.optimize import FIRE as ASE_FIRE
+from ase.optimize.fire2 import FIRE2 as ASE_FIRE2
 
 from .utils import ensure_directory
 
@@ -32,6 +34,8 @@ def baseline_task(
     first_optimizer: str = "LBFGS",
     second_optimizer: str = "LBFGS",
     fmax: float = 0.01,
+    fmax1: Optional[float] = None,
+    fmax2: Optional[float] = None,
     output_path: str = "./",
     model: str = "mace",
 ) -> dict:
@@ -64,12 +68,17 @@ def baseline_task(
 
     crystal.calc = calc
 
+    target_fmax1 = fmax1 if fmax1 is not None else fmax
+    target_fmax2 = fmax2 if fmax2 is not None else fmax
+
     optimizer_map = {
         "lbfgs": ASE_LBFGS,
         "quasinewton": ASE_QuasiNewton,
         "bfgs": ASE_BFGS,
         "bfgsfusedls": ASE_BFGS,
         "bfgslinesearch": ASE_BFGS,
+        "fire": ASE_FIRE,
+        "fire2": ASE_FIRE2,
     }
     first_opt_cls = optimizer_map.get(str(first_optimizer).lower(), ASE_LBFGS)
     second_opt_cls = optimizer_map.get(str(second_optimizer).lower(), ASE_LBFGS)
@@ -87,7 +96,7 @@ def baseline_task(
         opt1 = first_opt_cls(crystal)
 
     t0_s1 = time.perf_counter()
-    opt1.run(fmax=fmax, steps=max_steps)
+    opt1.run(fmax=target_fmax1, steps=max_steps)
     t1_s1 = time.perf_counter()
     s1_time = t1_s1 - t0_s1
     s1_steps = getattr(opt1, "nsteps", 0)
@@ -122,7 +131,7 @@ def baseline_task(
         opt2 = second_opt_cls(crystal)
 
     t0_s2 = time.perf_counter()
-    opt2.run(fmax=fmax, steps=max_steps)
+    opt2.run(fmax=target_fmax2, steps=max_steps)
     t1_s2 = time.perf_counter()
     s2_time = t1_s2 - t0_s2
     s2_steps = getattr(opt2, "nsteps", 0)
@@ -153,6 +162,8 @@ def run_baseline(
     optimizer1: str = "LBFGS",
     optimizer2: str = "LBFGS",
     fmax: float = 0.01,
+    fmax1: Optional[float] = None,
+    fmax2: Optional[float] = None,
     output_path: str = "./",
     model: str = "mace",
 ) -> None:
@@ -180,6 +191,8 @@ def run_baseline(
                 first_optimizer=optimizer1,
                 second_optimizer=optimizer2,
                 fmax=fmax,
+                fmax1=fmax1,
+                fmax2=fmax2,
                 output_path=output_path,
                 model=model,
             )
@@ -200,6 +213,8 @@ def run_baseline(
                     optimizer1,
                     optimizer2,
                     fmax,
+                    fmax1,
+                    fmax2,
                     output_path,
                     model,
                 )

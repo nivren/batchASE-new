@@ -39,12 +39,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size per worker")
     parser.add_argument("--max_steps", type=int, default=100, help="Maximum relaxation steps")
     parser.add_argument("--fmax", type=float, default=0.01, help="Force convergence threshold (eV/A)")
+    parser.add_argument("--fmax1", type=float, default=None, help="Force convergence threshold for Stage 1 (eV/A, defaults to --fmax)")
+    parser.add_argument("--fmax2", type=float, default=None, help="Force convergence threshold for Stage 2 (eV/A, defaults to --fmax)")
     parser.add_argument("--filter1", type=str, default="UnitCellFilter", help="Filter for Stage 1 (UnitCellFilter or none)")
     parser.add_argument("--filter2", type=str, default=None, help="Filter for Stage 2 (UnitCellFilter or none)")
     parser.add_argument("--optimizer1", type=str, default="BFGSFusedLS", help="Optimizer for Stage 1")
     parser.add_argument("--optimizer2", type=str, default="BFGSFusedLS", help="Optimizer for Stage 2")
     parser.add_argument("--skip_second_stage", type=str2bool, nargs="?", const=True, default=False, help="Skip the second relaxation stage")
-    parser.add_argument("--scalar_pressure", type=float, default=0.0006, help="External scalar pressure (GPa/unit)")
+    parser.add_argument("--scalar_pressure", type=float, default=0.0006, help="External scalar pressure in eV/A^3 (0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar)")
     parser.add_argument("--molecule_single", type=int, default=64, help="Reference atoms per molecule")
     parser.add_argument("--output_path", type=str, default="./", help="Directory for output files")
     parser.add_argument("--model", type=str, default="mace", help="MLIP model backend (mace, sevennet, chgnet, matris)")
@@ -113,8 +115,11 @@ def main():
 
     devices = [f"cuda:{i}" for i in range(args.gpu_offset, args.gpu_offset + args.n_gpus)]
 
+    fmax1 = args.fmax1 if args.fmax1 is not None else args.fmax
+    fmax2 = args.fmax2 if args.fmax2 is not None else args.fmax
+
     logging.info(f"Target devices: {devices}, Workers: {args.num_workers}, Batch size: {args.batch_size}")
-    logging.info(f"Optimizers: Stage1={args.optimizer1} (filter={args.filter1}), Stage2={args.optimizer2} (filter={args.filter2})")
+    logging.info(f"Optimizers: Stage1={args.optimizer1} (filter={args.filter1}, fmax={fmax1}), Stage2={args.optimizer2} (filter={args.filter2}, fmax={fmax2})")
 
     with open(os.path.join(output_path, "manifest.txt"), "w") as f:
         f.write("\n".join(files) + "\n")
@@ -142,6 +147,8 @@ def main():
             optimizer1=args.optimizer1,
             optimizer2=args.optimizer2,
             fmax=args.fmax,
+            fmax1=fmax1,
+            fmax2=fmax2,
             output_path=output_path,
             model=args.model,
         )
@@ -155,6 +162,8 @@ def main():
         batch_size=args.batch_size,
         max_steps=args.max_steps,
         fmax=args.fmax,
+        fmax1=fmax1,
+        fmax2=fmax2,
         filter1=filter1,
         filter2=filter2,
         optimizer1=args.optimizer1,
