@@ -370,6 +370,19 @@ class Scheduler:
         cluster_struct_rate = tot_struct_steps / max(elapsed, 1e-6)
         structs_per_min = (total_structures / max(elapsed, 1e-6)) * 60.0
 
+        model_name = self.model.upper() if hasattr(self, "model") and self.model else "MACE"
+        c_mlip = f" MLIP ({model_name}) Inference"[:31].ljust(31)
+
+        opt_header = f"Optimizer ({self.optimizer1})" if self.optimizer1 == self.optimizer2 else f"Optimizer ({self.optimizer1}/{self.optimizer2})"
+        c_opt = f" {opt_header}"[:31].ljust(31)
+
+        filt1 = (" + Cell" if "Cell" in str(self.filter1) else f" + {self.filter1}") if self.filter1 else ""
+        filt2 = (" + Cell" if "Cell" in str(self.filter2) else f" + {self.filter2}") if self.filter2 else ""
+        s1_tag = f"S1: {self.optimizer1}{filt1}"
+        s2_tag = f"S2: {self.optimizer2}{filt2}"
+        c_s1 = f"   ├─ {s1_tag}"[:31].ljust(31)
+        c_s2 = f"   └─ {s2_tag}"[:31].ljust(31)
+
         lines = [
             "",
             "=" * 96,
@@ -384,10 +397,10 @@ class Scheduler:
             "-" * 96,
             " Component                     Stage 1 (Press)   Stage 2 (Final)   Total Worker Time    Share (%)",
             "-" * 96,
-            f" MLIP (MACE) Inference         {s1_mace:>8.1f}s        {s2_mace:>8.1f}s          {total_mace:>8.1f}s        {mace_pct:>5.1f}%",
-            f" Optimizer (BFGS)              {s1_opt:>8.1f}s        {s2_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
-            f"   ├─ S1: BFGSFusedLS + Cell   {s1_opt:>8.1f}s               -            {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
-            f"   └─ S2: Standard BFGS              -          {s2_opt:>8.1f}s           {s2_opt:>8.1f}s        {s2_opt_pct:>5.1f}%",
+            f"{c_mlip}{s1_mace:>8.1f}s        {s2_mace:>8.1f}s          {total_mace:>8.1f}s        {mace_pct:>5.1f}%",
+            f"{c_opt}{s1_opt:>8.1f}s        {s2_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
+            f"{c_s1}{s1_opt:>8.1f}s               -            {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
+            f"{c_s2}      -          {s2_opt:>8.1f}s           {s2_opt:>8.1f}s        {s2_opt_pct:>5.1f}%",
             f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s        {s2_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
             f" Replenish & I/O               {s1_io:>8.1f}s        {s2_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
             "-" * 96,

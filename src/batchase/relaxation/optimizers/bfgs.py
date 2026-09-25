@@ -9,10 +9,11 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict
 import torch
 
 from ..optimizable import OptimizableBatch
+from ..cusolver_batched import cusolver_syevj_batched, is_cusolver_batched_available
 from .base import BatchOptimizer
 
 try:
@@ -52,7 +53,12 @@ class BFGS(BatchOptimizer):
 
 class _BFGSGpu(BFGS):
     """
-    GPU CUDA stream parallel batched BFGS optimizer.
+    Tensor-parallel GPU batched BFGS optimizer.
+    
+    Uses direct cuSOLVER batched eigenvalue decomposition (syevjBatched) and
+    tensorized bmm operations on a unified CUDA stream, eliminating multi-stream
+    spin-wait CPU lock and overcoming PyTorch's n <= 32 eigh limitation.
+    Supports both homogeneous fast-path and heterogeneous dimension bucketing.
     """
 
     def __init__(
@@ -68,21 +74,53 @@ class _BFGSGpu(BFGS):
         self.early_stop = early_stop
         self.device = torch.device(self.optimizable.device)
         self.state_device = self.device
-        self._streams = []
         self.initialize()
 
+    def _refresh_metadata(self) -> None:
+        self.batch_size = int(self.optimizable.batch_size)
+        self.elem_per_group = self.optimizable.elem_per_group
+        unique_elems = torch.unique(self.elem_per_group)
+        self.is_homogeneous = bool(len(unique_elems) <= 1)
+        flat_indices = self.optimizable.batch_indices.repeat_interleave(3)
+
+        if self.is_homogeneous:
+            self.dim = int(3 * self.elem_per_group[0].item()) if self.batch_size > 0 else 0
+            self._gather_idx = torch.argsort(flat_indices, stable=True)
+            self._dim_groups = None
+        else:
+            self.dim = None
+            self._gather_idx = None
+            dim_groups: Dict[int, List[int]] = {}
+            for i in range(self.batch_size):
+                d = int(3 * self.elem_per_group[i].item())
+                dim_groups.setdefault(d, []).append(i)
+            self._dim_groups = dim_groups
+
     def initialize(self) -> None:
-        batch_size = self.optimizable.batch_size
-        self.H = [None] * batch_size
+        self._refresh_metadata()
         pos = self.optimizable.get_positions()
         self.pos0 = torch.zeros_like(pos.reshape(-1), device=self.device, dtype=torch.float64)
         self.forces0 = torch.zeros_like(self.pos0, device=self.device, dtype=torch.float64)
-        if self.device.type == "cuda":
-            self._streams = [torch.cuda.Stream(device=self.device) for _ in range(batch_size)]
+
+        if self.is_homogeneous:
+            D = self.dim
+            B = self.batch_size
+            self.H = (
+                torch.eye(D, device=self.device, dtype=torch.float64)
+                .unsqueeze(0)
+                .repeat(B, 1, 1)
+                * self.alpha
+            )
+            self.initialized_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
+        else:
+            self.H = [None] * self.batch_size
+            self.initialized_mask = None
 
     def restart_from_earlystop(self, restart_indices: List[int], old_batch_indices: torch.Tensor) -> None:
-        batch_size = self.optimizable.batch_size
-        H_new = []
+        new_batch_size = int(self.optimizable.batch_size)
+        old_flat = old_batch_indices.repeat_interleave(3)
+        new_flat = self.optimizable.batch_indices.repeat_interleave(3)
+
         pos0_new = torch.zeros_like(
             self.optimizable.get_positions().reshape(-1),
             device=self.device,
@@ -90,26 +128,62 @@ class _BFGSGpu(BFGS):
         )
         forces0_new = torch.zeros_like(pos0_new, device=self.device, dtype=torch.float64)
 
-        old_flat = old_batch_indices.repeat_interleave(3)
-        new_flat = self.optimizable.batch_indices.repeat_interleave(3)
-
         for i, idx in enumerate(restart_indices):
             mask_old = (idx == old_flat)
             mask_new = (i == new_flat)
-            H_new.append(self.H[idx] if idx < len(self.H) else None)
             pos0_new[mask_new] = self.pos0[mask_old]
             forces0_new[mask_new] = self.forces0[mask_old]
 
-        for _ in range(len(H_new), batch_size):
-            H_new.append(None)
-
-        self.H = H_new
         self.pos0 = pos0_new
         self.forces0 = forces0_new
 
-        if self.device.type == "cuda":
-            while len(self._streams) < batch_size:
-                self._streams.append(torch.cuda.Stream(device=self.device))
+        old_is_homogeneous = getattr(self, "is_homogeneous", False)
+        old_H = self.H
+        old_init_mask = getattr(self, "initialized_mask", None)
+
+        self._refresh_metadata()
+
+        if self.is_homogeneous:
+            D = self.dim
+            H_new = torch.empty((new_batch_size, D, D), device=self.device, dtype=torch.float64)
+            eye_D = torch.eye(D, device=self.device, dtype=torch.float64) * self.alpha
+            init_mask_new = torch.zeros(new_batch_size, dtype=torch.bool, device=self.device)
+
+            for new_i, old_i in enumerate(restart_indices):
+                if old_is_homogeneous and old_H is not None and old_i < old_H.shape[0]:
+                    H_new[new_i] = old_H[old_i]
+                    if old_init_mask is not None and old_i < old_init_mask.shape[0]:
+                        init_mask_new[new_i] = old_init_mask[old_i]
+                    else:
+                        init_mask_new[new_i] = True
+                elif isinstance(old_H, list) and old_i < len(old_H) and old_H[old_i] is not None and old_H[old_i].shape == (D, D):
+                    H_new[new_i] = old_H[old_i]
+                    init_mask_new[new_i] = True
+                else:
+                    H_new[new_i] = eye_D
+                    init_mask_new[new_i] = False
+
+            for new_i in range(len(restart_indices), new_batch_size):
+                H_new[new_i] = eye_D
+                init_mask_new[new_i] = False
+
+            self.H = H_new
+            self.initialized_mask = init_mask_new
+        else:
+            H_new = []
+            for i, idx in enumerate(restart_indices):
+                if old_is_homogeneous and old_H is not None and idx < old_H.shape[0]:
+                    H_new.append(old_H[idx])
+                elif isinstance(old_H, list) and idx < len(old_H):
+                    H_new.append(old_H[idx])
+                else:
+                    H_new.append(None)
+
+            for _ in range(len(H_new), new_batch_size):
+                H_new.append(None)
+
+            self.H = H_new
+            self.initialized_mask = None
 
     def update_slots(self, keep_indices: List[int], num_new_slots: int) -> None:
         """Alias for compatibility with slot management interface."""
@@ -162,41 +236,63 @@ class _BFGSGpu(BFGS):
         pos_flat = pos.reshape(-1)
         self.update(pos_flat, forces_flat, self.pos0, self.forces0)
 
-        cur_indices = self.optimizable.batch_indices.repeat_interleave(3)
-        calc_indices = [
-            i for i, need_update in enumerate(self.optimizable.update_mask) if need_update
-        ]
+        if self.is_homogeneous:
+            B = self.batch_size
+            D = self.dim
+            f_b = forces_flat[self._gather_idx].view(B, D, 1)
 
-        dpos_list = [None] * len(self.H)
+            omega, V = cusolver_syevj_batched(self.H)
+            omega_abs = torch.clamp(torch.abs(omega), min=1e-6)  # [B, D]
 
-        if self.device.type == "cuda" and len(self._streams) >= len(self.H):
-            for i in calc_indices:
-                stream = self._streams[i]
-                with torch.cuda.stream(stream):
+            # Projected step: V @ (V^T f / |omega|)
+            Vt_f = torch.bmm(V.transpose(-1, -2), f_b)           # [B, D, 1]
+            scaled = Vt_f / omega_abs.unsqueeze(-1)              # [B, D, 1]
+            dpos_b = torch.bmm(V, scaled)                        # [B, D, 1]
+
+            # Zero out forces/steps for converged systems
+            update_mask = self.optimizable.update_mask.to(self.device).view(B, 1, 1)
+            dpos_b = dpos_b * update_mask
+
+            dpos_flat = torch.zeros_like(forces_flat)
+            dpos_flat[self._gather_idx] = dpos_b.reshape(-1)
+            dpos = dpos_flat.reshape(-1, 3)
+
+        else:
+            cur_indices = self.optimizable.batch_indices.repeat_interleave(3)
+            calc_indices = [
+                i for i, need_update in enumerate(self.optimizable.update_mask) if need_update
+            ]
+            dpos_list = [None] * self.batch_size
+
+            for dim, sys_indices in self._dim_groups.items():
+                active_in_group = [i for i in sys_indices if i in calc_indices]
+                if not active_in_group:
+                    continue
+
+                if len(active_in_group) >= 2:
+                    sub_H = torch.stack([self.H[i] for i in active_in_group], dim=0)
+                    omega, V = cusolver_syevj_batched(sub_H)
+                    omega_abs = torch.clamp(torch.abs(omega), min=1e-6)
+                    f_sub = torch.stack([forces_flat[cur_indices == i] for i in active_in_group], dim=0).unsqueeze(-1)
+                    Vt_f = torch.bmm(V.transpose(-1, -2), f_sub)
+                    dpos_sub = torch.bmm(V, Vt_f / omega_abs.unsqueeze(-1)).squeeze(-1)
+                    for j, idx in enumerate(active_in_group):
+                        dpos_list[idx] = dpos_sub[j]
+                else:
+                    i = active_in_group[0]
                     omega, V = torch.linalg.eigh(self.H[i])
                     omega_abs = torch.clamp(torch.abs(omega), min=1e-6)
                     f_i = forces_flat[cur_indices == i]
                     dpos_list[i] = (V @ (f_i.t() @ V / omega_abs).t())
 
-            torch.cuda.current_stream().synchronize()
-            for i in calc_indices:
-                self._streams[i].synchronize()
-        else:
-            for i in calc_indices:
-                omega, V = torch.linalg.eigh(self.H[i])
-                omega_abs = torch.clamp(torch.abs(omega), min=1e-6)
-                f_i = forces_flat[cur_indices == i]
-                dpos_list[i] = (V @ (f_i.t() @ V / omega_abs).t())
+            for i in range(self.batch_size):
+                if not self.optimizable.update_mask[i] or dpos_list[i] is None:
+                    dpos_list[i] = torch.zeros_like(forces_flat[cur_indices == i])
 
-        for i in range(len(self.H)):
-            if not self.optimizable.update_mask[i]:
-                dpos_list[i] = torch.zeros_like(forces_flat[cur_indices == i])
-
-        dpos = torch.zeros_like(forces_flat)
-        for i in torch.unique(cur_indices):
-            mask = (cur_indices == i)
-            dpos[mask] = dpos_list[i]
-        dpos = dpos.reshape(-1, 3)
+            dpos_flat = torch.zeros_like(forces_flat)
+            for i in torch.unique(cur_indices):
+                dpos_flat[cur_indices == i] = dpos_list[i]
+            dpos = dpos_flat.reshape(-1, 3)
 
         steplengths = (dpos ** 2).sum(dim=-1).sqrt()
         self.pos0 = pos_flat
@@ -224,40 +320,78 @@ class _BFGSGpu(BFGS):
         return dpos
 
     def update(self, pos: torch.Tensor, forces: torch.Tensor, pos0: torch.Tensor, forces0: torch.Tensor) -> None:
-        dpos = pos - pos0
-        dforces = forces - forces0
-        batch_indices_flatten = self.optimizable.batch_indices.repeat_interleave(3)
-        dg = torch.zeros_like(dforces)
-        all_size = self.optimizable.elem_per_group
+        dpos_flat = pos - pos0
+        dforces_flat = forces - forces0
 
-        for i in range(self.optimizable.batch_size):
-            if self.H[i] is None:
-                continue
-            mask = (i == batch_indices_flatten)
-            if torch.abs(dpos[mask]).max() < 1e-7:
-                continue
-            dg[mask] = self.H[i] @ dpos[mask]
+        if self.is_homogeneous:
+            B = self.batch_size
+            D = self.dim
 
-        a = self._batched_dot_1d(dforces, dpos)
-        b = self._batched_dot_1d(dpos, dg)
+            needs_init = ~self.initialized_mask
+            if needs_init.any():
+                eye_D = torch.eye(D, device=self.device, dtype=torch.float64) * self.alpha
+                self.H[needs_init] = eye_D
+                self.initialized_mask[needs_init] = True
 
-        for i in range(self.optimizable.batch_size):
-            if self.H[i] is None:
-                self.H[i] = (
-                    torch.eye(3 * all_size[i], device=self.device, dtype=torch.float64) * self.alpha
-                )
-                continue
-            mask = (i == batch_indices_flatten)
-            if not self.optimizable.update_mask[i]:
-                continue
-            if torch.abs(dpos[mask]).max() < 1e-7:
-                continue
-            if torch.abs(a[i]) < 1e-12 or torch.abs(b[i]) < 1e-12:
-                continue
+            can_update = ~needs_init
+            if not can_update.any():
+                return
 
-            outer_force = torch.outer(dforces[mask], dforces[mask])
-            outer_dg = torch.outer(dg[mask], dg[mask])
-            self.H[i] -= outer_force / a[i] + outer_dg / b[i]
+            dpos_b = dpos_flat[self._gather_idx].view(B, D, 1)
+            dforces_b = dforces_flat[self._gather_idx].view(B, D, 1)
+
+            dg_b = torch.bmm(self.H, dpos_b)
+
+            a = torch.sum(dforces_b * dpos_b, dim=1, keepdim=True)  # [B, 1, 1]
+            b = torch.sum(dpos_b * dg_b, dim=1, keepdim=True)        # [B, 1, 1]
+
+            update_mask = self.optimizable.update_mask.to(self.device).view(B, 1, 1)
+            dpos_max = dpos_b.abs().max(dim=1).values.view(B, 1, 1)
+            step_ok = dpos_max >= 1e-7
+            denom_ok = (a.abs() >= 1e-12) & (b.abs() >= 1e-12)
+            sys_mask = update_mask & step_ok & denom_ok & can_update.view(B, 1, 1)
+
+            outer_force = torch.bmm(dforces_b, dforces_b.transpose(1, 2))
+            outer_dg = torch.bmm(dg_b, dg_b.transpose(1, 2))
+            safe_a = torch.where(sys_mask, a, torch.ones_like(a))
+            safe_b = torch.where(sys_mask, b, torch.ones_like(b))
+
+            dH = (outer_force / safe_a) + (outer_dg / safe_b)
+            self.H -= torch.where(sys_mask, dH, torch.zeros_like(dH))
+
+        else:
+            all_size = self.optimizable.elem_per_group
+            batch_indices_flatten = self.optimizable.batch_indices.repeat_interleave(3)
+            dg = torch.zeros_like(dforces_flat)
+
+            for i in range(self.batch_size):
+                if self.H[i] is None:
+                    continue
+                mask = (i == batch_indices_flatten)
+                if torch.abs(dpos_flat[mask]).max() < 1e-7:
+                    continue
+                dg[mask] = self.H[i] @ dpos_flat[mask]
+
+            a = self._batched_dot_1d(dforces_flat, dpos_flat)
+            b = self._batched_dot_1d(dpos_flat, dg)
+
+            for i in range(self.batch_size):
+                if self.H[i] is None:
+                    self.H[i] = (
+                        torch.eye(3 * all_size[i], device=self.device, dtype=torch.float64) * self.alpha
+                    )
+                    continue
+                mask = (i == batch_indices_flatten)
+                if not self.optimizable.update_mask[i]:
+                    continue
+                if torch.abs(dpos_flat[mask]).max() < 1e-7:
+                    continue
+                if torch.abs(a[i]) < 1e-12 or torch.abs(b[i]) < 1e-12:
+                    continue
+
+                outer_force = torch.outer(dforces_flat[mask], dforces_flat[mask])
+                outer_dg = torch.outer(dg[mask], dg[mask])
+                self.H[i] -= outer_force / a[i] + outer_dg / b[i]
 
     def _batched_dot_1d(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         index = self.optimizable.batch_indices.repeat_interleave(3)

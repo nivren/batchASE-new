@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, Union
 import torch
 
+from .cusolver_batched import cusolver_syevj_batched, is_cusolver_batched_available
+
 logger = logging.getLogger("batchase.relaxation.linalg")
 
 
@@ -76,4 +78,6 @@ class LinalgBackend:
                 vals, vecs = torch.linalg.eigh(H_cpu)
                 return vals.to(original_device), vecs.to(original_device)
         else:
+            if H.is_cuda and is_cusolver_batched_available() and H.dim() == 3 and H.shape[-1] > 32:
+                return cusolver_syevj_batched(H)
             return torch.linalg.eigh(H)
