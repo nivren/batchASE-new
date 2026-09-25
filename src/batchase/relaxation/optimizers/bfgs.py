@@ -239,19 +239,47 @@ class _BFGSGpu(BFGS):
         if self.is_homogeneous:
             B = self.batch_size
             D = self.dim
+            update_mask = self.optimizable.update_mask.to(self.device)
+            active_idx = torch.where(update_mask)[0]
+            num_active = len(active_idx)
+
             f_b = forces_flat[self._gather_idx].view(B, D, 1)
 
-            omega, V = cusolver_syevj_batched(self.H)
-            omega_abs = torch.clamp(torch.abs(omega), min=1e-6)  # [B, D]
+            if num_active == 0:
+                dpos_b = torch.zeros(B, D, 1, device=self.device, dtype=torch.float64)
+            elif num_active == 1:
+                # Active-Slicing: fast-path for single long-running straggler (3.89ms vs 35.49ms)
+                idx = active_idx[0]
+                H_single = self.H[idx]
+                f_single = f_b[idx].squeeze(-1)
 
-            # Projected step: V @ (V^T f / |omega|)
-            Vt_f = torch.bmm(V.transpose(-1, -2), f_b)           # [B, D, 1]
-            scaled = Vt_f / omega_abs.unsqueeze(-1)              # [B, D, 1]
-            dpos_b = torch.bmm(V, scaled)                        # [B, D, 1]
+                omega, V = torch.linalg.eigh(H_single)
+                omega_abs = torch.clamp(torch.abs(omega), min=1e-6)
+                scaled = (V.t() @ f_single) / omega_abs
+                dpos_single = V @ scaled
 
-            # Zero out forces/steps for converged systems
-            update_mask = self.optimizable.update_mask.to(self.device).view(B, 1, 1)
-            dpos_b = dpos_b * update_mask
+                dpos_b = torch.zeros(B, D, 1, device=self.device, dtype=torch.float64)
+                dpos_b[idx, :, 0] = dpos_single
+            elif num_active < B:
+                # Active-Slicing: decompose only active matrices in sparse/tail batches
+                H_active = self.H[active_idx]
+                f_active = f_b[active_idx]
+
+                omega, V = cusolver_syevj_batched(H_active)
+                omega_abs = torch.clamp(torch.abs(omega), min=1e-6)
+                Vt_f = torch.bmm(V.transpose(-1, -2), f_active)
+                scaled = Vt_f / omega_abs.unsqueeze(-1)
+                dpos_act = torch.bmm(V, scaled)
+
+                dpos_b = torch.zeros(B, D, 1, device=self.device, dtype=torch.float64)
+                dpos_b[active_idx] = dpos_act
+            else:
+                # Full batch fast-path
+                omega, V = cusolver_syevj_batched(self.H)
+                omega_abs = torch.clamp(torch.abs(omega), min=1e-6)  # [B, D]
+                Vt_f = torch.bmm(V.transpose(-1, -2), f_b)           # [B, D, 1]
+                scaled = Vt_f / omega_abs.unsqueeze(-1)              # [B, D, 1]
+                dpos_b = torch.bmm(V, scaled)                        # [B, D, 1]
 
             dpos_flat = torch.zeros_like(forces_flat)
             dpos_flat[self._gather_idx] = dpos_b.reshape(-1)
@@ -315,7 +343,12 @@ class _BFGSGpu(BFGS):
 
         longest_steps = longest_steps[self.optimizable.batch_indices]
         maxstep = longest_steps.new_tensor(self.maxstep)
-        scale = (longest_steps).reciprocal() * torch.min(longest_steps, maxstep)
+        safe_steps = torch.where(longest_steps > 1e-12, longest_steps, torch.ones_like(longest_steps))
+        scale = torch.where(
+            longest_steps > 1e-12,
+            safe_steps.reciprocal() * torch.min(longest_steps, maxstep),
+            torch.zeros_like(longest_steps),
+        )
         dpos *= scale.unsqueeze(1)
         return dpos
 
@@ -337,27 +370,67 @@ class _BFGSGpu(BFGS):
             if not can_update.any():
                 return
 
+            update_mask = self.optimizable.update_mask.to(self.device)
+            active_update_idx = torch.where(update_mask & can_update)[0]
+            num_active = len(active_update_idx)
+            if num_active == 0:
+                return
+
             dpos_b = dpos_flat[self._gather_idx].view(B, D, 1)
             dforces_b = dforces_flat[self._gather_idx].view(B, D, 1)
 
-            dg_b = torch.bmm(self.H, dpos_b)
+            if num_active == 1:
+                idx = active_update_idx[0]
+                dp = dpos_b[idx]
+                df = dforces_b[idx]
+                dp_max = dp.abs().max()
+                if dp_max >= 1e-7:
+                    dg = self.H[idx] @ dp
+                    a = (df * dp).sum()
+                    b = (dp * dg).sum()
+                    if a.abs() >= 1e-12 and b.abs() >= 1e-12:
+                        dH = (df @ df.t()) / a + (dg @ dg.t()) / b
+                        self.H[idx] -= dH
+            elif num_active < B:
+                H_act = self.H[active_update_idx]
+                dp_act = dpos_b[active_update_idx]
+                df_act = dforces_b[active_update_idx]
+                dg_act = torch.bmm(H_act, dp_act)
 
-            a = torch.sum(dforces_b * dpos_b, dim=1, keepdim=True)  # [B, 1, 1]
-            b = torch.sum(dpos_b * dg_b, dim=1, keepdim=True)        # [B, 1, 1]
+                a = torch.sum(df_act * dp_act, dim=1, keepdim=True)
+                b = torch.sum(dp_act * dg_act, dim=1, keepdim=True)
 
-            update_mask = self.optimizable.update_mask.to(self.device).view(B, 1, 1)
-            dpos_max = dpos_b.abs().max(dim=1).values.view(B, 1, 1)
-            step_ok = dpos_max >= 1e-7
-            denom_ok = (a.abs() >= 1e-12) & (b.abs() >= 1e-12)
-            sys_mask = update_mask & step_ok & denom_ok & can_update.view(B, 1, 1)
+                dp_max = dp_act.abs().max(dim=1).values.view(num_active, 1, 1)
+                step_ok = dp_max >= 1e-7
+                denom_ok = (a.abs() >= 1e-12) & (b.abs() >= 1e-12)
+                sys_mask = step_ok & denom_ok
 
-            outer_force = torch.bmm(dforces_b, dforces_b.transpose(1, 2))
-            outer_dg = torch.bmm(dg_b, dg_b.transpose(1, 2))
-            safe_a = torch.where(sys_mask, a, torch.ones_like(a))
-            safe_b = torch.where(sys_mask, b, torch.ones_like(b))
+                outer_force = torch.bmm(df_act, df_act.transpose(1, 2))
+                outer_dg = torch.bmm(dg_act, dg_act.transpose(1, 2))
+                safe_a = torch.where(sys_mask, a, torch.ones_like(a))
+                safe_b = torch.where(sys_mask, b, torch.ones_like(b))
 
-            dH = (outer_force / safe_a) + (outer_dg / safe_b)
-            self.H -= torch.where(sys_mask, dH, torch.zeros_like(dH))
+                dH = (outer_force / safe_a) + (outer_dg / safe_b)
+                self.H[active_update_idx] -= torch.where(sys_mask, dH, torch.zeros_like(dH))
+            else:
+                dg_b = torch.bmm(self.H, dpos_b)
+
+                a = torch.sum(dforces_b * dpos_b, dim=1, keepdim=True)  # [B, 1, 1]
+                b = torch.sum(dpos_b * dg_b, dim=1, keepdim=True)        # [B, 1, 1]
+
+                update_mask_b = update_mask.view(B, 1, 1)
+                dpos_max = dpos_b.abs().max(dim=1).values.view(B, 1, 1)
+                step_ok = dpos_max >= 1e-7
+                denom_ok = (a.abs() >= 1e-12) & (b.abs() >= 1e-12)
+                sys_mask = update_mask_b & step_ok & denom_ok & can_update.view(B, 1, 1)
+
+                outer_force = torch.bmm(dforces_b, dforces_b.transpose(1, 2))
+                outer_dg = torch.bmm(dg_b, dg_b.transpose(1, 2))
+                safe_a = torch.where(sys_mask, a, torch.ones_like(a))
+                safe_b = torch.where(sys_mask, b, torch.ones_like(b))
+
+                dH = (outer_force / safe_a) + (outer_dg / safe_b)
+                self.H -= torch.where(sys_mask, dH, torch.zeros_like(dH))
 
         else:
             all_size = self.optimizable.elem_per_group

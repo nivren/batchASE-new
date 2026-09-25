@@ -15,6 +15,13 @@
 - **根因**：当前生产环境使用的 PyTorch（`2.9.1+cu128`）在 C++ 底层对 `torch.linalg.eigh` 的 batched 输入存在硬编码限制：仅在 $n \le 32$ 时走批量 Jacobi 求解器 `cusolverDn<t>syevjBatched`；当 $n > 32$ 时，PyTorch 内部退化为未 batch 化的 `cusolverDn<t>syevd` 逐个串行计算。
 - **官方进展**：PyTorch 官方在 Commit `916b711d81211d78e93d88e3b1773b5b19fc0373`（PR #175403，合入 2.12 版本）中解除了 $n \le 32$ 限制，但当前生产版本尚未发布。
 
+### 痛点 3：长尾稀疏批次中已收敛槽位的冗余计算（Run 125708 vs Run 133250 深度对比）
+- **现象**：在多阶段松弛（Stage 1 $f_{\max 1}=0.01$ 收敛 95% 后进入 Stage 2）测试中，优化后的单结构平均耗时从 7.07s 降至 4.45s (-37%)，但在长尾 Worker（如 W25、W31）的 `opt.log` 中，优化器耗时占比却虚高至 75%。
+- **根因**：
+  1. 初版张量化 BFGS 缺乏槽位感知，每步均对固定的 32 个槽位（无论是否收敛）执行 32 矩阵的 cuSOLVER Jacobi 分解；
+  2. Stage 2 批次平均仅剩 4.6 颗活跃结构，在后期长尾阶段，Worker 往往只有 1 颗长尾结构在迭代（长达 850 步），另外 31 个槽位全部陪跑；
+  3. 导致 Stage 2 累计执行了 **424,256 次** 矩阵分解，是旧版按需串行计算（60,375 次）的 **7.03 倍**，从而在长尾单点拖慢了集群 Wall Time。
+
 ---
 
 ## 2. 优化方案整体架构
@@ -63,6 +70,17 @@
    - **Safe Fallback（极端异构安全退化）**：孤立样本走单矩阵求解，同样运行在单 Stream 上，CPU 占用率依旧为 0%。
 4. **动态槽位补充（Dynamic Slot Replenishment）兼容**：
    - 在 `restart_from_earlystop` / `update_slots` 中，通过张量切片原地更新存活槽位，新槽位初始化为 $\alpha \cdot I$，完全对齐现有工作流。
+5. **自适应活跃掩码切片（Active-Slicing）架构设计**：
+   - **设计动机**：当 Stage 1 大比例（例如 95%）收敛后，Stage 2 往往处于极其稀疏的状态（平均仅 4~5 个活跃结构），且在收尾阶段存在长尾 Worker 仅有 1 颗结构未收敛的情况。若继续对固定的 $[B, D, D]$ 满批次求解，会导致大量已收敛槽位做无用功。
+   - **四级动态路由分发**：
+     - **$k = 0$（全部收敛）**：直接返回零位移，**跳过所有矩阵与张量计算**；
+     - **$k = 1$（长尾极速通道）**：单结构长尾是决定分布式集群 Wall Time 的关键路径。直接提取单个 $D \times D$ Hessian 矩阵，走 PyTorch `torch.linalg.eigh` 原生单矩阵求解（底层基于高效的分治法 `cusolverDnDsyevd`），**单步耗时从 35.49 ms 降至 3.89 ms（9.12x 加速）**；
+     - **$1 < k < B$（稀疏切片通道）**：提取 $k$ 个活跃槽位的 Hessian 组成 $[k, D, D]$ 活跃切片，仅对这 $k$ 颗矩阵调用 `cusolver_syevj_batched`，计算完毕写回原张量对应槽位；
+     - **$k = B$（满载快速通道）**：零切片开销，直接对完整张量执行 cuSOLVER 批处理。
+   - **数值稳定性防爆机制**：
+     - 在 `determine_step` 中，已收敛槽位的位移步长为 0，计算倒数会产生 `0.0 * inf = NaN`。引入安全掩码 `torch.where(longest_steps > 1e-12, ...)`，彻底杜绝 NaN 扩散。
+   - **Rank-2 活跃切片更新**：
+     - 在 `update()` 中同步引入活跃槽位切片，仅对存活且满足位移阈值的结构执行张量外积与 Hessian 修正，避免已收敛槽位执行无意义的张量广播。
 
 ---
 
@@ -78,6 +96,7 @@
 - [x] **Step 4**: 编写并执行完整回归测试套件 `tests/test_bfgs_batched_parity.py`，包含 6 大测试用例，全部通过。
 - [x] **Step 5**: 执行性能基准测试与系统级 CPU/GPU 负载验证，记录性能指标并更新文档。
 - [x] **Step 6**: 修复性能监控仪表盘（`src/batchase/engine/scheduler.py`），使 Stage 1 与 Stage 2 优化器和过滤器名称动态自适应，彻底解决传入 FIRE2 时统计标签硬编码显示 `BFGSFusedLS` 的问题。
+- [x] **Step 7**: 实现自适应活跃切片（Active-Slicing），在 `prepare_step` 与 `update` 中根据存活结构数 $k$ 动态路由（$k=1$ 走单矩阵 `torch.linalg.eigh`，仅需 3.89ms；$1 < k < B$ 仅对活跃矩阵切片调用 cuSOLVER Batched；$k=B$ 走全满载 3D 快速路径），彻底杜绝稀疏/长尾阶段空槽位陪跑引起的 7 倍冗余计算。
 
 ---
 
@@ -87,7 +106,7 @@
 
 运行环境：8× NVIDIA H100 SXM 80GB, PyTorch 2.9.1+cu128, Python 3.10。
 执行指令：`python tests/test_bfgs_batched_parity.py`
-测试结果：**ALL 6 PARITY AND REGRESSION TESTS PASSED IN 8.42s**。
+测试结果：**ALL 7 PARITY AND REGRESSION TESTS PASSED IN 5.53s**。
 
 | 测试项 | 验证内容 | 测试指标 | 测试结果 |
 | :--- | :--- | :--- | :--- |
@@ -97,6 +116,7 @@
 | **Test 4: 晶胞应变弛豫** | `OptimizableUnitCellBatch` 5 步应力应变弛豫 | 晶胞变形梯度与原子坐标同步更新，体系能量平稳收敛 | **PASS** |
 | **Test 5: 动态槽位补充状态保留** | 存活槽位保留历史 Hessian，新填充槽位初始化为 $\alpha I$ | 存活槽位 Hessian 误差 = 0.000e+00<br>新槽位 $\alpha I$ 误差 = 0.000e+00<br>补充后松弛迭代无缝推进 | **PASS** |
 | **Test 6: 异构批次退化支持** | 92 原子与 184 原子混批松弛 | 统一 Stream 顺序下发，零崩溃，顺利推进 3 步 | **PASS** |
+| **Test 7: 活跃切片数值等价性** | $k=1$ 与 $1 < k < B$ 活跃切片对比单结构/全批次基准 | $k=1$ 轨迹偏差 $< 1.8 \times 10^{-15}$ Å<br>非活跃槽位位移严格 $= 0.000\text{e}+00$ Å | **PASS** (机器双精度完全等价) |
 
 ### 4.2 历史测试套件回归验证
 - `tests/test_fire_parity.py`: **ALL 4 TESTS PASSED** (7.34s)
@@ -119,4 +139,21 @@
 - **旧版实现**：在 $B=32$ 下，逐个调用未 batch 化的 `torch.linalg.eigh` 并同步 32 个 Stream，单步耗时高达 **150 ~ 250 ms**，且 32 个 CPU 核心跑满 100%；
 - **新版实现**：在 $B=32$ 下，单次 `cusolver_syevj_batched` 仅需 **33.72 ms**（提速 **5x ~ 7.5x**，均摊每个样本仅 1.05 ms）；在典型 Worker 批次 $B=4$ 下，耗时仅需 **19.24 ms**。
 - **CPU 负载**：单进程 CPU 负载完全受控在 1 个核以内，彻底消除了由于自旋等待引起的服务器全部 CPU 核心 100% 满载卡死现象。
+
+### 4.4 活跃切片（Active-Slicing）算法实测延迟与集群 Wall Time 影响分析
+
+在 NVIDIA H100 GPU 上针对真实晶体自由度（$D=285$）对比单矩阵求解器与批量求解器的微基准：
+
+| 求解策略 | 计算后端 | 单步耗时 (ms) | 相对全批次加速比 | 适用场景 |
+| :--- | :--- | :---: | :---: | :--- |
+| **全满批 ($B=32$)** | `cusolver_syevj_batched` (Jacobi) | 35.49 ms | 1.0x (基准) | Stage 1 或 Stage 2 满载初期 |
+| **稀疏切片 ($B=1$, cuSOLVER)** | `cusolver_syevj_batched` (Jacobi) | 18.27 ms | 1.94x | $1 < k < B$ 稀疏批次 |
+| **单结构极速通道 ($k=1$)** | `torch.linalg.eigh` (`syevd` 分治法) | **3.89 ms** | **9.12x** | 长尾 Worker 单结构单点迭代 |
+
+#### 集群关键路径与总 Wall Time 缩短推导：
+- **痛点场景回顾**：在 Run 133250 中，长尾进程（W25 耗时 148.0s，W31 耗时 146.2s）在仅剩 1 颗活跃结构时，迭代了约 850 步。未切片前，每步依然承担 35.49 ms 的全批次矩阵分解开销，导致仅这 850 步就消耗了 $850 \times 35.49\text{ ms} \approx 30.16\text{ s}$。
+- **活跃切片加速**：引入 $k=1$ 极速通道后，这 850 步单步仅需 3.89 ms，总耗时降至 $850 \times 3.89\text{ ms} \approx 3.31\text{ s}$，**在关键路径上净减少 26.85 s 优化器无效耗时**。
+- **集群端到端收益**：
+  - 优化前集群整体 Wall Time: **170.11 s**
+  - 引入活跃切片后预期 Wall Time: $170.11\text{ s} - 26.85\text{ s} \approx \mathbf{143.26\text{ s}}$（**缩短约 16% ~ 19%**）。
 

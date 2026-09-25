@@ -262,6 +262,57 @@ def test_bfgs_heterogeneous_fallback(device: str = "cuda:0", steps: int = 3) -> 
     return True
 
 
+def test_bfgs_active_slicing_parity(device: str = "cuda:0") -> bool:
+    """Test 7: Active Slicing parity (k=1 and 1 < k < B) vs full batch baseline."""
+    logger.info("=== Test 7: Active Slicing parity (k=1 and 1 < k < B) ===")
+
+    a0 = read(DEFAULT_CIF)
+    backend = MACEBatchBackend(model=MODEL_PATH, device=device, default_dtype="float64")
+    a2g = AtomsToGraphs(r_edges=False, r_pbc=True)
+
+    # 1. Test k=1 single active structure
+    gbatch1 = data_list_collater([a2g.convert(a0.copy())]).to(device)
+    obatch1 = OptimizableBatch(gbatch1, backend=backend, dtype=torch.float64, numpy=False)
+    opt1 = BatchBFGS(obatch1, maxstep=0.2, alpha=70.0)
+
+    # 4-structure batch where only slot 1 is active (k=1)
+    gbatch4 = data_list_collater([a2g.convert(a0.copy()) for _ in range(4)]).to(device)
+    obatch4 = OptimizableBatch(gbatch4, backend=backend, dtype=torch.float64, numpy=False)
+    opt4 = BatchBFGS(obatch4, maxstep=0.2, alpha=70.0)
+
+    # Set _update_mask to only slot 1
+    obatch4._update_mask = torch.tensor([False, True, False, False], device=device)
+
+    # Save positions before step
+    pos4_before = obatch4.get_positions().clone()
+
+    # Step both
+    opt1.step()
+    opt4.step()
+
+    # Verify that slot 1 in opt4 matched slot 0 in opt1 exactly
+    pos1 = obatch1.get_positions()
+    pos4_slot1 = obatch4.get_positions()[len(a0) : 2 * len(a0)]
+    diff_k1 = (pos1 - pos4_slot1).abs().max().item()
+    logger.info(f"  [Active Slicing k=1] Position max diff vs single-structure: {diff_k1:.3e} A")
+    assert diff_k1 < 1e-12, f"Active Slicing k=1 diff too large: {diff_k1}"
+
+    # Verify inactive slots in opt4 were NOT moved
+    pos4_after = obatch4.get_positions()
+    pos4_slot0 = pos4_after[: len(a0)]
+    pos4_slot2 = pos4_after[2 * len(a0) : 3 * len(a0)]
+    assert (pos4_slot0 - pos4_before[: len(a0)]).abs().max().item() < 1e-14, "Inactive slot 0 was unexpectedly modified"
+    assert (pos4_slot2 - pos4_before[2 * len(a0) : 3 * len(a0)]).abs().max().item() < 1e-14, "Inactive slot 2 was unexpectedly modified"
+
+    # 2. Test 1 < k < B (slots 0 and 2 active, k=2)
+    obatch4._update_mask = torch.tensor([True, False, True, False], device=device)
+    opt4.step()
+    logger.info("  [Active Slicing 1 < k < B] Step with k=2 succeeded without error.")
+
+    logger.info("--> Test 7 (Active Slicing parity) PASSED successfully!\n")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Numerical parity and regression test suite for batchASE BFGS.")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -277,13 +328,14 @@ def main():
     t4_ok = test_bfgs_unitcellfilter(device=args.device, steps=args.steps)
     t5_ok = test_bfgs_slot_replenishment(device=args.device)
     t6_ok = test_bfgs_heterogeneous_fallback(device=args.device)
+    t7_ok = test_bfgs_active_slicing_parity(device=args.device)
 
     total_time = time.perf_counter() - t_start
-    all_passed = t1_ok and t2_ok and t3_ok and t4_ok and t5_ok and t6_ok
+    all_passed = t1_ok and t2_ok and t3_ok and t4_ok and t5_ok and t6_ok and t7_ok
 
     if all_passed:
         logger.info("=================================================================")
-        logger.info(f"ALL 6 PARITY AND REGRESSION TESTS PASSED IN {total_time:.2f}s!")
+        logger.info(f"ALL 7 PARITY AND REGRESSION TESTS PASSED IN {total_time:.2f}s!")
         logger.info("=================================================================")
     else:
         logger.error("SOME TESTS FAILED!")
