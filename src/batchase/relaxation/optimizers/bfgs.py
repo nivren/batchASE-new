@@ -498,11 +498,13 @@ class _BFGSCpu(BFGS):
         alpha: float = 70.0,
         early_stop: bool = False,
         bfgs_cpu_thread: int = 16,
+        f_upper_limit: float = 100.0,
         **kwargs,
     ) -> None:
         super(BFGS, self).__init__(optimizable=optimizable_batch, maxstep=maxstep)
         self.alpha = alpha
         self.early_stop = early_stop
+        self.f_upper_limit = f_upper_limit
         self.device = torch.device(self.optimizable.device)
         self.state_device = torch.device("cpu")
         self._executor: Optional[ThreadPoolExecutor] = None
@@ -731,7 +733,16 @@ class _BFGSCpu(BFGS):
             )
         longest_steps = longest_steps[self.optimizable.batch_indices]
         maxstep = longest_steps.new_tensor(self.maxstep)
-        scale = longest_steps.reciprocal() * torch.min(longest_steps, maxstep)
+        safe_steps = torch.where(
+            longest_steps > 1e-12,
+            longest_steps,
+            torch.ones_like(longest_steps),
+        )
+        scale = torch.where(
+            longest_steps > 1e-12,
+            safe_steps.reciprocal() * torch.min(longest_steps, maxstep),
+            torch.zeros_like(longest_steps),
+        )
         dpos *= scale.unsqueeze(1)
         return dpos
 
