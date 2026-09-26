@@ -171,20 +171,23 @@ class Worker:
             orig_cells = None
 
         opt_cls = get_optimizer_cls(optimizer_name)
+        optimizer_key = optimizer_name.lower()
         opt_kwargs = {
             "maxstep": 0.2,
             "early_stop": True,
-            "device": self.device,
             "f_upper_limit": self.f_upper_limit,
-            "use_profiler": self.use_profiler,
-            "profiler_log_dir": self.profiler_log_dir,
-            "profiler_schedule_config": self.profiler_schedule_config,
         }
-        if optimizer_name == "BFGS":
+        if optimizer_key == "bfgs":
             opt_kwargs["alpha"] = 70.0
             opt_kwargs["bfgs_cpu_thread"] = self.bfgs_cpu_thread
-        elif optimizer_name in ("BFGSFusedLS", "BFGSLineSearch"):
-            opt_kwargs["alpha"] = 10.0
+        elif optimizer_key in ("bfgsfusedls", "bfgslinesearch"):
+            opt_kwargs.update(
+                alpha=10.0,
+                device=self.device,
+                use_profiler=self.use_profiler,
+                profiler_log_dir=self.profiler_log_dir,
+                profiler_schedule_config=self.profiler_schedule_config,
+            )
 
         batch_optimizer = opt_cls(obatch, **opt_kwargs)
 

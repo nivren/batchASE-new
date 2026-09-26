@@ -15,11 +15,6 @@ from typing import TYPE_CHECKING
 import ase
 import torch
 
-try:
-    from torch_scatter import scatter
-except ImportError:
-    scatter = None
-
 if TYPE_CHECKING:
     from ..optimizable import OptimizableBatch
 
@@ -176,51 +171,37 @@ class LBFGS:
 
     def determine_step(self, dr):
         steplengths = torch.norm(dr, dim=1)
-        if device == 'cuda':
-            longest_steps = scatter(
-                steplengths, self.optimizable.batch_indices, reduce="max"
-            )
-        else:
-            index = self.optimizable.batch_indices
-            src = steplengths
-
-            num_groups = int(index.max().item()) + 1
-
-            out = torch.full(
-                (num_groups,),
-                float('-inf'),
-                device=src.device,
-                dtype=src.dtype
-            )
-
-            longest_steps = out.scatter_reduce(
-                dim=0,
-                index=index,
-                src=src,
-                reduce="amax",
-                include_self=True
-            )
-        longest_steps = longest_steps[self.optimizable.batch_indices]
+        index = self.optimizable.batch_indices
+        longest_steps = torch.full(
+            (self.optimizable.batch_size,),
+            float("-inf"),
+            device=steplengths.device,
+            dtype=steplengths.dtype,
+        ).scatter_reduce(
+            dim=0,
+            index=index,
+            src=steplengths,
+            reduce="amax",
+            include_self=True,
+        )
+        longest_steps = longest_steps[index]
         maxstep = longest_steps.new_tensor(self.maxstep)
-        # scale = (longest_steps + 1e-7).reciprocal() * torch.min(longest_steps, maxstep)
-        scale = (longest_steps).reciprocal() * torch.min(longest_steps, maxstep)
+        scale = torch.clamp(
+            maxstep / torch.clamp(longest_steps, min=1e-12),
+            max=1.0,
+        )
         dr *= scale.unsqueeze(1)
         return dr * self.damping
 
     def _batched_dot(self, x: torch.Tensor, y: torch.Tensor):
-        if device == 'cuda':
-            return scatter(
-                (x * y).sum(dim=-1), self.optimizable.batch_indices, reduce="sum"
-            )
-        else:
-            index = self.optimizable.batch_indices
-            src = (x * y).sum(dim=-1)   # shape: (N,)
-            num_groups = int(index.max().item()) + 1
-            out = torch.zeros(
-                num_groups, device=src.device, dtype=src.dtype
-            )
-            out.scatter_add_(dim=0, index=index, src=src)
-            return out
+        index = self.optimizable.batch_indices
+        src = (x * y).sum(dim=-1)
+        out = torch.zeros(
+            self.optimizable.batch_size,
+            device=src.device,
+            dtype=src.dtype,
+        )
+        return out.scatter_add_(dim=0, index=index, src=src)
 
     def step(self, iteration: int) -> None:
         # cast forces and positions to float64 otherwise the algorithm is prone to overflow

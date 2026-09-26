@@ -10,11 +10,6 @@ import math
 import gc
 from ..optimizable import OptimizableBatch
 
-try:
-    from torch_scatter import scatter
-except ImportError:
-    scatter = None
-
 class BFGSFusedLS:
     """
     Port of BFGSLineSearch from bfgslinesearch.py, adapted to PyTorch
@@ -445,36 +440,6 @@ class BFGSFusedLS:
             return self.optimizable.converged(
                 forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
             )
-
-    def _batched_dot_2d(self, x: torch.Tensor, y: torch.Tensor):
-        if device == 'cuda':
-            return scatter(
-                (x * y).sum(dim=-1), self.optimizable.batch_indices, reduce="sum"
-            )
-        else:
-            index = self.optimizable.batch_indices
-            src = (x * y).sum(dim=-1)   # shape: (N,)
-            num_groups = int(index.max().item()) + 1
-            out = torch.zeros(
-                num_groups, device=src.device, dtype=src.dtype
-            )
-            out.scatter_add_(dim=0, index=index, src=src)
-            return out
-    
-    def _batched_dot_1d(self, x: torch.Tensor, y: torch.Tensor):
-        if device == 'cuda':
-            return scatter(
-                (x * y), self.optimizable.batch_indices.repeat_interleave(3), reduce="sum"
-            )
-        else:
-            index = self.optimizable.batch_indices.repeat_interleave(3)
-            src = (x * y)   # shape: (N,)
-            num_groups = int(index.max().item()) + 1
-            out = torch.zeros(
-                num_groups, device=src.device, dtype=src.dtype
-            )
-            out.scatter_add_(dim=0, index=index, src=src)
-            return out
 
 # flake8: noqa
 import math
