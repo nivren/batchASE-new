@@ -898,9 +898,8 @@ class OptimizableUnitCellBatch(OptimizableBatch):
             virial *= self.mask.view(-1, 3, 3)
 
         if self.constant_volume:
-            virial[:, range(3), range(3)] -= (
-                self._batch_trace(virial).view(3, -1) / 3.0
-            )
+            diagonal = virial.diagonal(dim1=-2, dim2=-1)
+            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
 
         natoms = self.batch.num_nodes
         augmented_forces = torch.zeros(
@@ -1232,8 +1231,8 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
             deform_grad_log_force[batch_idx] = torch.from_numpy(deform_grad_log_force_batch).to(self.device)
 
         if self.constant_volume:
-            dglf_trace = self._batch_trace(deform_grad_log_force).view(-1, 1, 1)
-            deform_grad_log_force -= self._batch_diag(dglf_trace.squeeze() / 3.0)
+            diagonal = deform_grad_log_force.diagonal(dim1=-2, dim2=-1)
+            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
 
         natoms = self.batch.num_nodes
         augmented_forces = torch.zeros(
