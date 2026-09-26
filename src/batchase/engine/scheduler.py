@@ -255,18 +255,35 @@ class Scheduler:
             s1_time = float(s1_data.get("runtime", 0.0))
             s1_energy = float(s1_data.get("energy", 0.0))
             s1_density = float(s1_data.get("density", 0.0))
-
             s2_steps = int(s2_data.get("steps", 0))
             s2_time = float(s2_data.get("runtime", 0.0))
             s2_energy = float(s2_data.get("energy", 0.0))
             s2_density = float(s2_data.get("density", 0.0))
 
+            s1_status = s1_data.get("status", "converged" if s1_data.get("converged") else "failed")
+            s1_failed_reason = s1_data.get("failed_reason") or ""
+            s2_status = s2_data.get("status", "converged" if s2_data.get("converged") else "failed") if s2_data else ""
+            s2_failed_reason = (s2_data.get("failed_reason") or "") if s2_data else ""
+
+            if s2_data:
+                final_status = s2_status
+                final_failed_reason = s2_failed_reason
+            else:
+                final_status = s1_status
+                final_failed_reason = s1_failed_reason
+
             records.append({
                 "file": stem,
+                "status": final_status,
+                "failed_reason": final_failed_reason,
+                "stage1_status": s1_status,
+                "stage1_failed_reason": s1_failed_reason,
                 "stage1_steps": s1_steps,
                 "stage1_time": s1_time,
                 "stage1_energy": s1_energy,
                 "stage1_density": s1_density,
+                "stage2_status": s2_status,
+                "stage2_failed_reason": s2_failed_reason,
                 "stage2_steps": s2_steps,
                 "stage2_time": s2_time,
                 "stage2_energy": s2_energy,
@@ -281,10 +298,16 @@ class Scheduler:
                     f,
                     fieldnames=[
                         "file",
+                        "status",
+                        "failed_reason",
+                        "stage1_status",
+                        "stage1_failed_reason",
                         "stage1_steps",
                         "stage1_time",
                         "stage1_energy",
                         "stage1_density",
+                        "stage2_status",
+                        "stage2_failed_reason",
                         "stage2_steps",
                         "stage2_time",
                         "stage2_energy",

@@ -67,11 +67,13 @@ class _BFGSGpu(BFGS):
         maxstep: float = 0.2,
         alpha: float = 70.0,
         early_stop: bool = False,
+        f_upper_limit: float = 100.0,
         **kwargs,
     ) -> None:
         super(BFGS, self).__init__(optimizable=optimizable_batch, maxstep=maxstep)
         self.alpha = alpha
         self.early_stop = early_stop
+        self.f_upper_limit = f_upper_limit
         self.device = torch.device(self.optimizable.device)
         self.state_device = self.device
         self.initialize()
@@ -197,9 +199,12 @@ class _BFGSGpu(BFGS):
         is_restart_earlystop: bool = False,
         restart_indices: Optional[List[int]] = None,
         old_batch_indices: Optional[torch.Tensor] = None,
+        f_upper_limit: Optional[float] = None,
     ) -> List[int]:
         self.fmax = fmax
         self.max_iter = steps
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         if is_restart_earlystop and restart_indices is not None and old_batch_indices is not None:
             self.restart_from_earlystop(restart_indices, old_batch_indices)
@@ -208,11 +213,12 @@ class _BFGSGpu(BFGS):
         max_forces = self.optimizable.get_max_forces(apply_constraint=True)
 
         while iteration < self.max_iter and not self.optimizable.converged(
-            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=1e25
+            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
         ):
             if self.early_stop and iteration > 0:
                 converge_indices = self.optimizable.converge_indices_list
-                if len(converge_indices) > 0:
+                failed_indices = getattr(self.optimizable, "failed_indices_list", [])
+                if len(converge_indices) > 0 or len(failed_indices) > 0:
                     break
 
             self.step()
@@ -220,9 +226,11 @@ class _BFGSGpu(BFGS):
             iteration += 1
 
         self.nsteps = iteration
+        self.converge_indices_list = self.optimizable.converge_indices_list
+        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
         if self.early_stop:
-            return self.optimizable.converge_indices_list
-        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces)
+            return self.converge_indices_list
+        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit)
 
     def step(self, fmax: float = 0.01) -> None:
         forces = self.optimizable.get_forces(apply_constraint=True).to(dtype=torch.float64)
@@ -599,9 +607,12 @@ class _BFGSCpu(BFGS):
         is_restart_earlystop: bool = False,
         restart_indices: Optional[List[int]] = None,
         old_batch_indices: Optional[torch.Tensor] = None,
+        f_upper_limit: Optional[float] = None,
     ) -> List[int]:
         self.fmax = fmax
         self.max_iter = steps
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         if is_restart_earlystop and restart_indices is not None and old_batch_indices is not None:
             self.restart_from_earlystop(restart_indices, old_batch_indices)
@@ -610,11 +621,12 @@ class _BFGSCpu(BFGS):
         max_forces = self.optimizable.get_max_forces(apply_constraint=True)
 
         while iteration < self.max_iter and not self.optimizable.converged(
-            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=1e25
+            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
         ):
             if self.early_stop and iteration > 0:
                 converge_indices = self.optimizable.converge_indices_list
-                if len(converge_indices) > 0:
+                failed_indices = getattr(self.optimizable, "failed_indices_list", [])
+                if len(converge_indices) > 0 or len(failed_indices) > 0:
                     break
 
             self.step()
@@ -622,9 +634,11 @@ class _BFGSCpu(BFGS):
             iteration += 1
 
         self.nsteps = iteration
+        self.converge_indices_list = self.optimizable.converge_indices_list
+        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
         if self.early_stop:
-            return self.optimizable.converge_indices_list
-        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces)
+            return self.converge_indices_list
+        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit)
 
     def step(self, fmax: float = 0.01) -> None:
         forces = self.optimizable.get_forces(apply_constraint=True).to(dtype=torch.float64)

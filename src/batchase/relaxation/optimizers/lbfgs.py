@@ -38,6 +38,7 @@ class LBFGS:
         traj_dir: Path | None = None,
         traj_names: list[str] | None = None,
         early_stop: bool = False,
+        f_upper_limit: float = 100.0,
     ) -> None:
         """
         Args:
@@ -75,10 +76,13 @@ class LBFGS:
         ), "Trajectory names should be specified to save trajectories"
 
         self.early_stop  = early_stop
+        self.f_upper_limit = f_upper_limit
 
-    def run(self, fmax, steps):
+    def run(self, fmax, steps, f_upper_limit=None):
         self.fmax = fmax
         self.steps = steps
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         self.s.clear()
         self.y.clear()
@@ -99,12 +103,13 @@ class LBFGS:
         # print("Step   Fmax(eV/A)")
 
         while iteration < steps and not self.optimizable.converged(
-            forces=None, fmax=self.fmax, max_forces=max_forces
+            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
         ):
 
             if self.early_stop:
                 converge_indices_list = self.optimizable.converge_indices_list
-                if len(converge_indices_list) > 0:
+                failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
+                if len(converge_indices_list) > 0 or len(failed_indices_list) > 0:
                     logging.debug(f"Early stopping at iteration {iteration}")
                     break
 
@@ -159,13 +164,14 @@ class LBFGS:
             setattr(self.optimizable.batch, name, value)
 
         self.nsteps = iteration
+        self.converge_indices_list = self.optimizable.converge_indices_list
+        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
 
         if self.early_stop:
-            converge_indices_list = self.optimizable.converge_indices_list
-            return converge_indices_list
+            return self.converge_indices_list
         else:
             return self.optimizable.converged(
-                forces=None, fmax=self.fmax, max_forces=max_forces
+                forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
             )
 
     def determine_step(self, dr):

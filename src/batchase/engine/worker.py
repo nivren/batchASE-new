@@ -85,6 +85,8 @@ class Worker:
         self.use_fasteq = use_fasteq
         self.cueq = cueq
         self.bfgs_cpu_thread = bfgs_cpu_thread
+        self.f_upper_limit = float(kwargs.get("f_upper_limit", 100.0))
+        self.stage2_include_unconverged = bool(kwargs.get("stage2_include_unconverged", False))
         self.use_profiler = kwargs.get("use_profiler", False)
         self.profiler_log_dir = kwargs.get("profiler_log_dir", None)
         self.profiler_schedule_config = kwargs.get("profiler_schedule_config", None)
@@ -173,6 +175,7 @@ class Worker:
             "maxstep": 0.2,
             "early_stop": True,
             "device": self.device,
+            "f_upper_limit": self.f_upper_limit,
             "use_profiler": self.use_profiler,
             "profiler_log_dir": self.profiler_log_dir,
             "profiler_schedule_config": self.profiler_schedule_config,
@@ -196,6 +199,7 @@ class Worker:
         stage_mace_start = backend.mace_time
         stage_graph_start = backend.graph_time
         output_cif_paths = []
+        stage_success_cifs = []
 
         while converged_atoms_count < len(files):
             # Dynamic batch replenishment when structures finish
@@ -282,9 +286,14 @@ class Worker:
                     is_restart_earlystop=True,
                     restart_indices=restart_indices,
                     old_batch_indices=old_batch_indices,
+                    f_upper_limit=self.f_upper_limit,
                 )
             else:
-                converge_indices = batch_optimizer.run(stage_fmax, remaining_steps)
+                converge_indices = batch_optimizer.run(
+                    stage_fmax,
+                    remaining_steps,
+                    f_upper_limit=self.f_upper_limit,
+                )
             t_burst_end = time.perf_counter()
             burst_duration = t_burst_end - t_burst_start
             total_burst_time += burst_duration
@@ -297,10 +306,12 @@ class Worker:
 
             # Update step count and detect completed/over-step slots
             cur_batch_steps = [s + burst_steps for s in cur_batch_steps]
+            failed_indices = getattr(obatch, "failed_indices_list", [])
+            failed_reasons = getattr(obatch, "failed_reasons", {})
             over_maxstep_indices = [
                 i for i, s in enumerate(cur_batch_steps) if s >= self.max_steps
             ]
-            all_indices = list(set(converge_indices + over_maxstep_indices))
+            all_indices = list(set(converge_indices + failed_indices + over_maxstep_indices))
 
             # Retrieve latest atoms and energies
             optimized_atoms = obatch.get_atoms_list()
@@ -340,6 +351,16 @@ class Worker:
                 steps = cur_batch_steps[idx]
                 rate = steps / runtime
                 is_conv = idx in converge_indices
+                if is_conv:
+                    status = "converged"
+                    failed_reason = None
+                else:
+                    status = "failed"
+                    if idx in failed_indices:
+                        failed_reason = failed_reasons.get(idx, "unknown_failure")
+                    else:
+                        failed_reason = "max_steps"
+
                 conv_str = "YES" if is_conv else "NO"
                 fmax_val = max_forces_list[idx] if idx < len(max_forces_list) else 0.0
 
@@ -363,12 +384,25 @@ class Worker:
                 out_cif = os.path.join(cif_dir, f"{stem}.cif")
                 out_json = os.path.join(json_dir, f"{stem}.json")
 
-                optimized_atoms[idx].write(out_cif)
-                output_cif_paths.append(out_cif)
+                cif_written = False
+                try:
+                    if is_conv or (status != "failed") or (failed_reason not in ("nan_force", "invalid_cell")):
+                        optimized_atoms[idx].write(out_cif)
+                        output_cif_paths.append(out_cif)
+                        cif_written = True
+                except Exception as e:
+                    logger.warning(f"Could not write CIF for {stem}: {e}")
+
+                # Stage 2 qualification: only converged structures (or optionally max_steps) proceed
+                can_proceed = is_conv or (self.stage2_include_unconverged and failed_reason == "max_steps")
+                if can_proceed and cif_written:
+                    stage_success_cifs.append(out_cif)
 
                 result_data = {
                     "file": stem,
+                    "status": status,
                     "converged": is_conv,
+                    "failed_reason": failed_reason,
                     "fmax": fmax_val,
                     "steps": steps,
                     "runtime": runtime,
@@ -381,9 +415,10 @@ class Worker:
                 with open(out_json, "w", encoding="utf-8") as f:
                     json.dump(result_data, f, indent=2)
 
+                fail_msg = f" fail_reason={failed_reason}" if not is_conv else ""
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] DONE {stem}: "
-                    f"conv={conv_str} steps={steps} ({rate:.1f} st/s) fmax={fmax_val:.4f} t={runtime:.1f}s "
+                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) fmax={fmax_val:.4f} t={runtime:.1f}s "
                     f"[mace:{mace_s:.1f}s({mace_pct:.1f}%) opt:{opt_s:.1f}s({opt_pct:.1f}%) other:{other_s:.1f}s({other_pct:.1f}%)]"
                 )
 
@@ -420,10 +455,12 @@ class Worker:
         )
         logger.info(
             f"{self.worker_tag} [{stage_name}] completed: {len(files)} structures in {stage_total_time:.2f}s "
-            f"({total_steps_in_stage} steps, {stage_rate:.1f} st/s, peak_vram: {vram_gb:.2f} GB)"
+            f"({len(stage_success_cifs)} qualified for next stage, {total_steps_in_stage} steps, {stage_rate:.1f} st/s, peak_vram: {vram_gb:.2f} GB)"
         )
         stage_metrics = {
             "structures": len(files),
+            "converged": len(stage_success_cifs),
+            "output_cifs": len(output_cif_paths),
             "steps": total_steps_in_stage,
             "elapsed_s": stage_total_time,
             "mace_s": final_mace_time,
@@ -432,7 +469,7 @@ class Worker:
             "io_s": final_io_time,
             "peak_vram_gb": vram_gb,
         }
-        return output_cif_paths, stage_metrics
+        return stage_success_cifs, stage_metrics
 
     def run(self) -> None:
         """Run complete 2-stage or 1-stage relaxation pipeline."""

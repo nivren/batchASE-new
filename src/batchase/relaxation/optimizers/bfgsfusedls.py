@@ -34,6 +34,7 @@ class BFGSFusedLS:
         profiler_log_dir: str = './log',
         profiler_schedule_config: dict = None,
         dtype: torch.dtype = torch.float64,
+        f_upper_limit: float = 100.0,
     ):
         self.optimizable = optimizable_batch
         self.maxstep = maxstep
@@ -45,12 +46,14 @@ class BFGSFusedLS:
         self.device = device if device is not None else optimizable_batch.device
         self.force_calls = 0
         self.early_stop = early_stop
+        self.f_upper_limit = f_upper_limit
         self.use_profiler = use_profiler
         self.profiler_log_dir = profiler_log_dir
         self.profiler_schedule_config = profiler_schedule_config or {"wait": 48, "warmup": 1, "active": 1, "repeat": 8}
         self.dtype = dtype
 
         self.converge_indices_list = None
+        self.failed_indices_list = None
 
         # The information from the previous round is useful for the current round's calculations.
         ## These variables need to be update accroding to new input when eary stop is triggered.
@@ -324,7 +327,16 @@ class BFGSFusedLS:
         forces = self.optimizable.get_forces().reshape(-1)
         return - forces / self.alpha
     
-    def run(self, fmax=0.01, maxstep=None, steps=None, is_restart_earlystop=False, restart_indices=None, old_batch_indices=None):
+    def run(
+        self,
+        fmax=0.01,
+        maxstep=None,
+        steps=None,
+        is_restart_earlystop=False,
+        restart_indices=None,
+        old_batch_indices=None,
+        f_upper_limit=None,
+    ):
         logging.debug("Enter bfgsfusedlinesearch's main program.")
         if steps is not None and maxstep is None:
             maxstep = steps
@@ -332,6 +344,8 @@ class BFGSFusedLS:
             maxstep = 100
         self.fmax = fmax
         self.max_iter = maxstep
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         if is_restart_earlystop:
             self.restart_from_earlystop(restart_indices, old_batch_indices)
@@ -362,12 +376,16 @@ class BFGSFusedLS:
             ) as prof:
                 # Main optimization loop with profiling
                 while iteration < self.max_iter and not self.optimizable.converged(
-                    forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=1e25,
+                    forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit,
                 ):
                     if self.early_stop and iteration > 0:
                         self.converge_indices_list = self.optimizable.converge_indices_list
-                        if len(self.converge_indices_list) > 0:
-                            logging.debug(f"Early stopping at iteration {iteration}")
+                        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
+                        if len(self.converge_indices_list) > 0 or len(self.failed_indices_list) > 0:
+                            logging.debug(
+                                f"Early stopping at iteration {iteration} "
+                                f"(converged={len(self.converge_indices_list)}, failed={len(self.failed_indices_list)})"
+                            )
                             break
 
                     logging.debug(
@@ -384,12 +402,16 @@ class BFGSFusedLS:
         else:
             # Original optimization loop without profiling
             while iteration < self.max_iter and not self.optimizable.converged(
-                forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=1e25,
+                forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit,
             ):
                 if self.early_stop and iteration > 0:
                     self.converge_indices_list = self.optimizable.converge_indices_list
-                    if len(self.converge_indices_list) > 0:
-                        logging.debug(f"Early stopping at iteration {iteration}")
+                    self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
+                    if len(self.converge_indices_list) > 0 or len(self.failed_indices_list) > 0:
+                        logging.debug(
+                            f"Early stopping at iteration {iteration} "
+                            f"(converged={len(self.converge_indices_list)}, failed={len(self.failed_indices_list)})"
+                        )
                         break
 
                 logging.debug(
@@ -417,10 +439,11 @@ class BFGSFusedLS:
 
         if self.early_stop:
             self.converge_indices_list = self.optimizable.converge_indices_list
+            self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
             return self.converge_indices_list
         else:
             return self.optimizable.converged(
-                forces=None, fmax=self.fmax, max_forces=max_forces
+                forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
             )
 
     def _batched_dot_2d(self, x: torch.Tensor, y: torch.Tensor):

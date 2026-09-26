@@ -20,6 +20,7 @@ from ase.stress import voigt_6_to_full_3x3_stress
 
 
 from .ase_utils import batch_to_atoms
+from .status import SlotStatus, FailReason
 from itertools import product
 
 from ..potentials.base import BatchPotential
@@ -182,6 +183,12 @@ class OptimizableBatch(Optimizable):
         self._eps = masked_eps
         self.dtype = dtype
 
+        batch_count = getattr(self.batch, "num_graphs", None)
+        if batch_count is None:
+            batch_count = len(self.batch) if hasattr(self.batch, "__len__") else 1
+        self._slot_status = [SlotStatus.ACTIVE] * batch_count
+        self._slot_reasons: dict[int, str] = {}
+
         self.otf_graph = True  # trainer._unwrapped_model.otf_graph
         if not self.otf_graph and "edge_index" not in self.batch:
             self.update_graph()
@@ -238,20 +245,62 @@ class OptimizableBatch(Optimizable):
         return self.batch.batch
 
     @property
+    def slot_status(self) -> list[SlotStatus]:
+        return self._slot_status
+
+    @property
+    def failed_reasons(self) -> dict[int, str]:
+        return self._slot_reasons
+
+    @property
+    def active_indices_list(self) -> list[int]:
+        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.ACTIVE]
+
+    @property
+    def converge_indices_list(self) -> list[int]:
+        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.CONVERGED]
+
+    @property
+    def failed_indices_list(self) -> list[int]:
+        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.FAILED]
+
+    @property
+    def finished_indices_list(self) -> list[int]:
+        return [i for i, s in enumerate(self._slot_status) if s != SlotStatus.ACTIVE]
+
+    @property
     def converged_mask(self):
-        if self._update_mask is not None:
-            return torch.logical_not(self._update_mask)
-        return None
+        return torch.tensor(
+            [s == SlotStatus.CONVERGED for s in self._slot_status],
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+    @property
+    def failed_mask(self):
+        return torch.tensor(
+            [s == SlotStatus.FAILED for s in self._slot_status],
+            device=self.device,
+            dtype=torch.bool,
+        )
 
     @property
     def update_mask(self):
         if self._update_mask is None:
-            return torch.ones(len(self.batch), dtype=bool)
+            self._update_mask = torch.tensor(
+                [s == SlotStatus.ACTIVE for s in self._slot_status],
+                device=self.device,
+                dtype=torch.bool,
+            )
         return self._update_mask
 
-    @property
-    def converge_indices_list(self):
-        return torch.where(~self.update_mask)[0].tolist()
+    def mark_failed(self, slot_idx: int, reason: str) -> None:
+        """Explicitly mark a slot as failed with a given reason."""
+        if 0 <= slot_idx < len(self._slot_status):
+            self._slot_status[slot_idx] = SlotStatus.FAILED
+            self._slot_reasons[slot_idx] = reason
+            if self._update_mask is not None:
+                self._update_mask[slot_idx] = False
 
     @property
     def elem_per_group(self):
@@ -501,12 +550,12 @@ class OptimizableBatch(Optimizable):
 
     def converged(
         self,
-        forces: torch.Tensor | NDArray | None,
-        fmax: float,
+        forces: torch.Tensor | NDArray | None = None,
+        fmax: float = 0.05,
         max_forces: torch.Tensor | None = None,
-        f_upper_limit: float = 1e20,
+        f_upper_limit: float = 100.0,
     ) -> bool:
-        """Check if norm of all predicted forces are below fmax"""
+        """Check if all structures in batch are finished (converged or failed) using tensorized vectorization."""
         if forces is not None:
             if isinstance(forces, np.ndarray):
                 forces = torch.tensor(
@@ -516,24 +565,89 @@ class OptimizableBatch(Optimizable):
         elif max_forces is None:
             max_forces = self.get_max_forces()
 
-        # Update mask is True for forces that are greater than fmax AND less than f_upper_limit
-        update_mask = torch.logical_and(
-            max_forces.ge(fmax), max_forces.le(f_upper_limit)
-        )
-        # update cached mask
-        if self.mask_converged:
-            if self._update_mask is None:
-                self._update_mask = update_mask
-            else:
-                # some models can have random noise in their predictions, so the mask is updated by
-                # keeping all previously converged structures masked even if new force predictions
-                # push it slightly above threshold
-                self._update_mask = torch.logical_and(
-                    self._update_mask, update_mask
-                )
-            update_mask = self._update_mask
+        if max_forces.dim() == 0:
+            max_forces = max_forces.unsqueeze(0)
 
-        return not torch.any(update_mask).item()
+        n_slots = len(self._slot_status)
+        dev = max_forces.device
+
+        # Track which slots are currently in terminal states
+        if self.mask_converged:
+            is_terminal = torch.tensor(
+                [s in (SlotStatus.CONVERGED, SlotStatus.FAILED) for s in self._slot_status],
+                device=dev,
+                dtype=torch.bool,
+            )
+        else:
+            is_terminal = torch.zeros(n_slots, device=dev, dtype=torch.bool)
+
+        # Vectorized cell validity check
+        has_cell_check = hasattr(self.batch, "cell") and self.batch.cell is not None
+        if has_cell_check:
+            cells = self.get_cells()
+            if cells.shape[0] == n_slots:
+                dets = torch.linalg.det(cells)
+                # invalid if nan, inf, or det <= 1e-6 (covers non-positive and inverted cells)
+                cell_invalid = torch.isnan(dets) | torch.isinf(dets) | (dets <= 1e-6)
+            else:
+                cell_invalid = torch.zeros(n_slots, device=dev, dtype=torch.bool)
+        else:
+            cell_invalid = torch.zeros(n_slots, device=dev, dtype=torch.bool)
+
+        # Slice forces to n_slots
+        mf = max_forces[:n_slots]
+        nan_f = torch.isnan(mf)
+        inf_f = torch.isinf(mf)
+        overflow_f = (mf > f_upper_limit) & (~nan_f) & (~inf_f)
+        conv_f = (mf < fmax) & (~nan_f) & (~inf_f)
+
+        # Only evaluate non-terminal slots
+        cell_invalid = cell_invalid & (~is_terminal)
+        nan_f = nan_f & (~is_terminal) & (~cell_invalid)
+        inf_f = inf_f & (~is_terminal) & (~cell_invalid)
+        overflow_f = overflow_f & (~is_terminal) & (~cell_invalid)
+        conv_f = conv_f & (~is_terminal) & (~cell_invalid)
+
+        # Vectorized active mask
+        new_active = (~is_terminal) & (~cell_invalid) & (~nan_f) & (~inf_f) & (~overflow_f) & (~conv_f)
+        self._update_mask = new_active
+
+        # If any slot changed to terminal state, sync status to host
+        any_new_failed = (cell_invalid | nan_f | inf_f | overflow_f).any().item()
+        any_new_conv = conv_f.any().item()
+
+        if any_new_failed or any_new_conv or (not self.mask_converged):
+            status_codes = torch.zeros(n_slots, dtype=torch.int8, device=dev)
+            status_codes[conv_f] = 1
+            status_codes[nan_f] = 2
+            status_codes[inf_f] = 3
+            status_codes[overflow_f] = 4
+            status_codes[cell_invalid] = 5
+
+            codes_list = status_codes.cpu().tolist()
+            for i, code in enumerate(codes_list):
+                if is_terminal[i].item():
+                    continue
+                if code == 1:
+                    self._slot_status[i] = SlotStatus.CONVERGED
+                    self._slot_reasons.pop(i, None)
+                elif code == 2:
+                    self._slot_status[i] = SlotStatus.FAILED
+                    self._slot_reasons[i] = FailReason.NAN_FORCE
+                elif code == 3:
+                    self._slot_status[i] = SlotStatus.FAILED
+                    self._slot_reasons[i] = FailReason.INF_FORCE
+                elif code == 4:
+                    self._slot_status[i] = SlotStatus.FAILED
+                    self._slot_reasons[i] = FailReason.FORCE_OVERFLOW
+                elif code == 5:
+                    self._slot_status[i] = SlotStatus.FAILED
+                    self._slot_reasons[i] = FailReason.INVALID_CELL
+                else:
+                    self._slot_status[i] = SlotStatus.ACTIVE
+                    self._slot_reasons.pop(i, None)
+
+        return not torch.any(self._update_mask).item()
 
     def get_atoms_list(self) -> list[Atoms]:
         """Get ase Atoms objects corresponding to the batch"""
