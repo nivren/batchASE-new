@@ -14,13 +14,6 @@ import torch
 from ..optimizable import OptimizableBatch
 from .base import BatchOptimizer
 
-try:
-    from torch_scatter import scatter
-    _has_scatter = True
-except ImportError:
-    scatter = None
-    _has_scatter = False
-
 logger = logging.getLogger("batchase.optimizers.fire")
 
 
@@ -41,12 +34,9 @@ def _batched_dot_per_system(
         [B] dot product per system
     """
     prod = (x * y).sum(dim=-1)  # [N]
-    if _has_scatter and prod.is_cuda:
-        return scatter(prod, batch_indices, dim=0, dim_size=num_systems, reduce="sum")
-    out = torch.zeros((num_systems,), device=prod.device, dtype=prod.dtype).scatter_add_(
-        0, batch_indices, prod
-    )
-    return out
+    return torch.zeros(
+        (num_systems,), device=prod.device, dtype=prod.dtype
+    ).scatter_add_(0, batch_indices, prod)
 
 
 def _batched_norm_per_system(
@@ -226,7 +216,12 @@ class _BatchFIREBase(BatchOptimizer):
                 neg_atoms = neg_mask[batch_idx]
                 self.v[neg_atoms] = 0.0
                 self.a[neg_mask] = self.astart
-                self.dt[neg_mask] = torch.maximum(self.dt[neg_mask] * self.fdec, dt_min_t)
+                # ASE native FIRE has no dtmin lower bound; only clamp when
+                # dtmin > 0 (i.e. when used via FIRE2 flavor).
+                new_dt = self.dt[neg_mask] * self.fdec
+                if self.dtmin > 0:
+                    new_dt = torch.maximum(new_dt, dt_min_t)
+                self.dt[neg_mask] = new_dt
                 self.Nsteps[neg_mask] = 0
 
             # 3. Acceleration (Euler)
@@ -364,7 +359,7 @@ class FIRE(_BatchFIREBase):
         dt: float = 0.1,
         maxstep: float = 0.2,
         dtmax: float = 1.0,
-        dtmin: float = 2e-3,
+        dtmin: float = 0.0,
         Nmin: int = 5,
         finc: float = 1.1,
         fdec: float = 0.5,
