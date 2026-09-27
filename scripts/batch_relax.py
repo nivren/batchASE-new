@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--scalar_pressure", type=float, default=0.0006, help="External scalar pressure in eV/A^3 (0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar)")
     parser.add_argument("--molecule_single", type=int, default=64, help="Reference atoms per molecule")
     parser.add_argument("--output_path", type=str, default="./", help="Directory for output files")
-    parser.add_argument("--model", type=str, default="mace", help="MLIP model backend (mace, sevennet, chgnet, matris)")
+    parser.add_argument("--model", type=str, default="mace", choices=["mace"], help="MLIP model backend (currently supported: mace)")
     parser.add_argument("--use_ordered_files", type=str2bool, nargs="?", const=True, default=False, help="Sort CIF files by atomic count descending")
     parser.add_argument("--use_fasteq", type=str2bool, nargs="?", const=True, default=False, help="Enable FastEq acceleration")
     parser.add_argument("--cueq", type=str2bool, nargs="?", const=True, default=False, help="Enable cuEquivariance acceleration")
