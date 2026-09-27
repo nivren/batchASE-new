@@ -1,11 +1,12 @@
 from .base import BatchPotential
 from .mace import MACEBatchBackend
+from .mock import MockBatchBackend
 from .sevennet import SevenNetBatchBackend
 from .chgnet import CHGNetBatchBackend
 from .matris import MatRISBatchBackend
 
 
-SUPPORTED_BACKENDS = ("mace",)
+SUPPORTED_BACKENDS = ("mace", "mock")
 UNIMPLEMENTED_BACKENDS = ("sevennet", "chgnet", "matris", "matgl")
 
 
@@ -20,6 +21,8 @@ def create_backend(backend: str = "mace", **kwargs) -> BatchPotential:
     if b_name in SUPPORTED_BACKENDS:
         if b_name == "mace":
             return MACEBatchBackend(**kwargs)
+        if b_name == "mock":
+            return MockBatchBackend(**kwargs)
     elif b_name in UNIMPLEMENTED_BACKENDS:
         raise NotImplementedError(
             f"Backend '{backend}' is currently a placeholder/under active development "
@@ -34,6 +37,7 @@ def create_backend(backend: str = "mace", **kwargs) -> BatchPotential:
 __all__ = [
     "BatchPotential",
     "MACEBatchBackend",
+    "MockBatchBackend",
     "SevenNetBatchBackend",
     "CHGNetBatchBackend",
     "MatRISBatchBackend",

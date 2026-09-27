@@ -49,7 +49,8 @@ def parse_args():
     parser.add_argument("--scalar_pressure", type=float, default=0.0006, help="External scalar pressure in eV/A^3 (0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar)")
     parser.add_argument("--molecule_single", type=int, default=None, help="Reference atoms per single molecule for energy normalization")
     parser.add_argument("--output_path", type=str, default="./", help="Directory for output files")
-    parser.add_argument("--model", type=str, default="mace", choices=["mace"], help="MLIP model backend (currently supported: mace)")
+    parser.add_argument("--model", type=str, default="mace", choices=["mace", "mock"], help="MLIP model backend (supported: mace, mock)")
+    parser.add_argument("--device", type=str, default=None, help="Execution device (for example 'cpu' or 'cuda:0'); overrides --n_gpus")
     parser.add_argument("--use_ordered_files", type=str2bool, nargs="?", const=True, default=False, help="Sort CIF files by atomic count descending")
     parser.add_argument("--use_fasteq", type=str2bool, nargs="?", const=True, default=False, help="Enable FastEq acceleration")
     parser.add_argument("--cueq", type=str2bool, nargs="?", const=True, default=False, help="Enable cuEquivariance acceleration")
@@ -113,7 +114,9 @@ def main():
     output_path = os.path.abspath(args.output_path)
     ensure_directory(output_path)
 
-    devices = [f"cuda:{i}" for i in range(args.gpu_offset, args.gpu_offset + args.n_gpus)]
+    devices = [args.device] if args.device else [
+        f"cuda:{i}" for i in range(args.gpu_offset, args.gpu_offset + args.n_gpus)
+    ]
 
     fmax1 = args.fmax1 if args.fmax1 is not None else args.fmax
     fmax2 = args.fmax2 if args.fmax2 is not None else args.fmax
