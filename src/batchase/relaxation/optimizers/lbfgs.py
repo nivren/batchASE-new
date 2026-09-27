@@ -143,10 +143,6 @@ class LBFGS:
         if iteration > 0 and self.trajectories is not None:
             self.write()
 
-        # GPU memory usage as per nvidia-smi seems to gradually build up as
-        # batches are processed. This releases unoccupied cached memory.
-        torch.cuda.empty_cache()
-
         if self.trajectories is not None:
             for traj in self.trajectories:
                 traj.close()

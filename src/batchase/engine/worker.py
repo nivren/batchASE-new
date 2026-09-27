@@ -4,6 +4,7 @@ Single-process, single-GPU Worker for batched structure optimization.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -121,6 +122,12 @@ class Worker:
             return (mass / vol) * 1.66053906660
         except Exception:
             return 0.0
+
+    def _clear_stage_memory(self) -> None:
+        """Release unreachable stage objects and unused CUDA cache blocks once."""
+        gc.collect()
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     def _run_stage(
         self,
@@ -646,31 +653,37 @@ class Worker:
         worker_start_time = time.perf_counter()
 
         # Stage 1: Pressure relaxation
-        s1_cifs, s1_metrics = self._run_stage(
-            files=self.files,
-            stage_name="press",
-            filter_type=self.filter1,
-            optimizer_name=self.optimizer1,
-            scalar_pressure=self.scalar_pressure,
-            backend=backend,
-            a2g=a2g,
-            fmax=self.fmax1,
-        )
+        try:
+            s1_cifs, s1_metrics = self._run_stage(
+                files=self.files,
+                stage_name="press",
+                filter_type=self.filter1,
+                optimizer_name=self.optimizer1,
+                scalar_pressure=self.scalar_pressure,
+                backend=backend,
+                a2g=a2g,
+                fmax=self.fmax1,
+            )
+        finally:
+            self._clear_stage_memory()
 
         stages_dict = {"press": s1_metrics}
 
         # Stage 2: Final relaxation
         if not self.skip_second_stage and s1_cifs:
-            s2_cifs, s2_metrics = self._run_stage(
-                files=s1_cifs,
-                stage_name="final",
-                filter_type=self.filter2,
-                optimizer_name=self.optimizer2,
-                scalar_pressure=0.0,
-                backend=backend,
-                a2g=a2g,
-                fmax=self.fmax2,
-            )
+            try:
+                s2_cifs, s2_metrics = self._run_stage(
+                    files=s1_cifs,
+                    stage_name="final",
+                    filter_type=self.filter2,
+                    optimizer_name=self.optimizer2,
+                    scalar_pressure=0.0,
+                    backend=backend,
+                    a2g=a2g,
+                    fmax=self.fmax2,
+                )
+            finally:
+                self._clear_stage_memory()
             stages_dict["final"] = s2_metrics
 
         total_elapsed = time.perf_counter() - worker_start_time

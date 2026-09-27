@@ -7,7 +7,6 @@ from torch.profiler import profile, record_function, ProfilerActivity, schedule,
 from datetime import datetime
 import os
 import math
-import gc
 from ..optimizable import OptimizableBatch
 
 class BFGSFusedLS:
@@ -420,11 +419,6 @@ class BFGSFusedLS:
         logging.debug(
             f"{iteration} " + " ".join(f"{x:18.15g}" for x in max_forces.tolist())
         )
-
-        # GPU memory usage as per nvidia-smi seems to gradually build up as
-        # batches are processed. This releases unoccupied cached memory.
-        torch.cuda.empty_cache()
-        gc.collect()
 
         # set predicted values to batch
         for name, value in self.optimizable.results.items():
