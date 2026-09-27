@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--optimizer2", type=str, default="BFGSFusedLS", help="Optimizer for Stage 2")
     parser.add_argument("--skip_second_stage", type=str2bool, nargs="?", const=True, default=False, help="Skip the second relaxation stage")
     parser.add_argument("--scalar_pressure", type=float, default=0.0006, help="External scalar pressure in eV/A^3 (0.0006 eV/A^3 ≈ 0.096 GPa / ~1000 bar)")
-    parser.add_argument("--molecule_single", type=int, default=64, help="Reference atoms per molecule")
+    parser.add_argument("--molecule_single", type=int, default=None, help="Reference atoms per single molecule for energy normalization")
     parser.add_argument("--output_path", type=str, default="./", help="Directory for output files")
     parser.add_argument("--model", type=str, default="mace", choices=["mace"], help="MLIP model backend (currently supported: mace)")
     parser.add_argument("--use_ordered_files", type=str2bool, nargs="?", const=True, default=False, help="Sort CIF files by atomic count descending")

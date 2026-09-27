@@ -47,7 +47,7 @@ class Worker:
         optimizer2: str = "BFGSFusedLS",
         skip_second_stage: bool = False,
         scalar_pressure: float = 0.0006,
-        molecule_single: int = 64,
+        molecule_single: Optional[int] = None,
         output_path: str = "./",
         model: str = "mace",
         use_fasteq: bool = False,
@@ -80,7 +80,8 @@ class Worker:
         self.optimizer2 = optimizer2
         self.skip_second_stage = skip_second_stage
         self.scalar_pressure = scalar_pressure
-        self.molecule_single = molecule_single
+        mol_single_raw = molecule_single if molecule_single is not None else kwargs.get("molecule_single", None)
+        self.molecule_single = int(mol_single_raw) if mol_single_raw is not None and int(mol_single_raw) > 0 else None
         self.output_path = os.path.abspath(output_path)
         self.model = model
         self.use_fasteq = use_fasteq
@@ -379,12 +380,32 @@ class Worker:
                 other_pct = other_ratio * 100.0
 
                 natoms = len(optimized_atoms[idx])
-                num_mol = natoms / self.molecule_single if self.molecule_single > 0 else 1.0
+                num_mol = None
+                energy_per_mol = None
+                normalization_status = "unnormalized"
+
+                if self.molecule_single is not None and self.molecule_single > 0:
+                    if natoms % self.molecule_single == 0:
+                        num_mol = natoms // self.molecule_single
+                        normalization_status = "normalized"
+                    else:
+                        normalization_status = "invalid_atom_count"
+                        logger.warning(
+                            f"{self.worker_tag} [{stem}] natoms ({natoms}) is not divisible by molecule_single "
+                            f"({self.molecule_single}). Cannot compute per-molecule energy."
+                        )
+
                 e_raw = energies_list[idx] if idx < len(energies_list) else 0.0
                 if isinstance(e_raw, (list, tuple)):
                     e_raw = e_raw[0]
                 e_val = float(e_raw)
-                energy_per_mol = (e_val / num_mol) * 96.485 if num_mol > 0 else e_val
+
+                if num_mol is not None and num_mol > 0:
+                    energy_per_mol = (e_val / num_mol) * 96.485
+                    energy_out = energy_per_mol
+                else:
+                    energy_out = e_val * 96.485
+
                 density = self._get_density(optimized_atoms[idx])
 
                 stem = Path(cur_batch_path[idx]).stem
@@ -413,7 +434,13 @@ class Worker:
                     "fmax": fmax_val,
                     "steps": steps,
                     "runtime": runtime,
-                    "energy": energy_per_mol,
+                    "natoms": natoms,
+                    "molecule_single": self.molecule_single,
+                    "num_molecules": num_mol,
+                    "normalization_status": normalization_status,
+                    "energy_raw_ev": e_val,
+                    "energy_per_mol": energy_per_mol,
+                    "energy": energy_out,
                     "density": density,
                     "mace_time": mace_s,
                     "opt_time": opt_s,

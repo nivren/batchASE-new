@@ -72,7 +72,7 @@ class Scheduler:
         model: str = "mace",
         use_fasteq: bool = False,
         cueq: bool = False,
-        molecule_single: int = 64,
+        molecule_single: Optional[int] = None,
         bfgs_cpu_thread: int = 1,
         compile_mode: Optional[str] = None,
         **kwargs,
@@ -95,7 +95,8 @@ class Scheduler:
         self.model = model
         self.use_fasteq = use_fasteq
         self.cueq = cueq
-        self.molecule_single = molecule_single
+        mol_single_raw = molecule_single if molecule_single is not None else kwargs.pop("molecule_single", None)
+        self.molecule_single = int(mol_single_raw) if mol_single_raw is not None and int(mol_single_raw) > 0 else None
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.pop("compile_mode", None)
 
@@ -275,10 +276,17 @@ class Scheduler:
                 final_status = s1_status
                 final_failed_reason = s1_failed_reason
 
+            natoms = int(s2_data.get("natoms") or s1_data.get("natoms") or 0)
+            num_molecules = s2_data.get("num_molecules") if "num_molecules" in s2_data else s1_data.get("num_molecules")
+            norm_status = s2_data.get("normalization_status") or s1_data.get("normalization_status") or "unnormalized"
+
             records.append({
                 "file": stem,
                 "status": final_status,
                 "failed_reason": final_failed_reason,
+                "natoms": natoms,
+                "num_molecules": num_molecules if num_molecules is not None else "",
+                "normalization_status": norm_status,
                 "stage1_status": s1_status,
                 "stage1_failed_reason": s1_failed_reason,
                 "stage1_steps": s1_steps,
@@ -303,6 +311,9 @@ class Scheduler:
                         "file",
                         "status",
                         "failed_reason",
+                        "natoms",
+                        "num_molecules",
+                        "normalization_status",
                         "stage1_status",
                         "stage1_failed_reason",
                         "stage1_steps",
