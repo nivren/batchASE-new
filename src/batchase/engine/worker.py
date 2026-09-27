@@ -323,15 +323,34 @@ class Worker:
 
             # Retrieve latest atoms and energies
             optimized_atoms = obatch.get_atoms_list()
+            def _to_flat_list(val):
+                if hasattr(val, "detach"):
+                    val = val.detach().cpu()
+                if hasattr(val, "view"):
+                    return val.view(-1).tolist()
+                elif isinstance(val, np.ndarray):
+                    return val.flatten().tolist()
+                elif hasattr(val, "tolist"):
+                    return val.tolist()
+                return list(val)
+
             raw_energies = obatch.get_potential_energies()
-            if hasattr(raw_energies, "view"):
-                energies_list = raw_energies.view(-1).tolist()
-            elif isinstance(raw_energies, np.ndarray):
-                energies_list = raw_energies.flatten().tolist()
-            elif hasattr(raw_energies, "tolist"):
-                energies_list = raw_energies.tolist()
+            energies_list = _to_flat_list(raw_energies)
+
+            if hasattr(obatch, "get_internal_energies"):
+                internal_energies_list = _to_flat_list(obatch.get_internal_energies())
             else:
-                energies_list = list(raw_energies)
+                internal_energies_list = energies_list
+
+            if hasattr(obatch, "get_pv_terms"):
+                pv_terms_list = _to_flat_list(obatch.get_pv_terms())
+            else:
+                pv_terms_list = [0.0] * len(energies_list)
+
+            if hasattr(obatch, "get_enthalpies"):
+                enthalpies_list = _to_flat_list(obatch.get_enthalpies())
+            else:
+                enthalpies_list = energies_list
 
             try:
                 max_forces_tensor = obatch.get_max_forces()
@@ -400,11 +419,31 @@ class Worker:
                     e_raw = e_raw[0]
                 e_val = float(e_raw)
 
+                e_int_raw = internal_energies_list[idx] if idx < len(internal_energies_list) else e_val
+                if isinstance(e_int_raw, (list, tuple)):
+                    e_int_raw = e_int_raw[0]
+                e_int_val = float(e_int_raw)
+
+                pv_raw = pv_terms_list[idx] if idx < len(pv_terms_list) else 0.0
+                if isinstance(pv_raw, (list, tuple)):
+                    pv_raw = pv_raw[0]
+                pv_val = float(pv_raw)
+
+                h_raw = enthalpies_list[idx] if idx < len(enthalpies_list) else e_val
+                if isinstance(h_raw, (list, tuple)):
+                    h_raw = h_raw[0]
+                h_val = float(h_raw)
+
                 if num_mol is not None and num_mol > 0:
+                    energy_kj_mol = (e_int_val / num_mol) * 96.485
+                    enthalpy_kj_mol = (h_val / num_mol) * 96.485
                     energy_per_mol = (e_val / num_mol) * 96.485
-                    energy_out = energy_per_mol
                 else:
-                    energy_out = e_val * 96.485
+                    energy_kj_mol = None
+                    enthalpy_kj_mol = None
+                    energy_per_mol = None
+
+                energy_out = (e_val / num_mol * 96.485) if (num_mol is not None and num_mol > 0) else e_val * 96.485
 
                 density = self._get_density(optimized_atoms[idx])
 
@@ -438,7 +477,11 @@ class Worker:
                     "molecule_single": self.molecule_single,
                     "num_molecules": num_mol,
                     "normalization_status": normalization_status,
-                    "energy_raw_ev": e_val,
+                    "energy_raw_ev": e_int_val,
+                    "enthalpy_raw_ev": h_val,
+                    "pv_raw_ev": pv_val,
+                    "energy_kj_mol": energy_kj_mol,
+                    "enthalpy_kj_mol": enthalpy_kj_mol,
                     "energy_per_mol": energy_per_mol,
                     "energy": energy_out,
                     "density": density,

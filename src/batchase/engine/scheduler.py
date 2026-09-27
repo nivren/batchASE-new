@@ -280,6 +280,11 @@ class Scheduler:
             num_molecules = s2_data.get("num_molecules") if "num_molecules" in s2_data else s1_data.get("num_molecules")
             norm_status = s2_data.get("normalization_status") or s1_data.get("normalization_status") or "unnormalized"
 
+            s1_energy_kj_mol = s1_data.get("energy_kj_mol")
+            s1_enthalpy_kj_mol = s1_data.get("enthalpy_kj_mol")
+            s2_energy_kj_mol = s2_data.get("energy_kj_mol")
+            s2_enthalpy_kj_mol = s2_data.get("enthalpy_kj_mol")
+
             records.append({
                 "file": stem,
                 "status": final_status,
@@ -292,12 +297,16 @@ class Scheduler:
                 "stage1_steps": s1_steps,
                 "stage1_time": s1_time,
                 "stage1_energy": s1_energy,
+                "stage1_energy_kj_mol": s1_energy_kj_mol if s1_energy_kj_mol is not None else "",
+                "stage1_enthalpy_kj_mol": s1_enthalpy_kj_mol if s1_enthalpy_kj_mol is not None else "",
                 "stage1_density": s1_density,
                 "stage2_status": s2_status,
                 "stage2_failed_reason": s2_failed_reason,
                 "stage2_steps": s2_steps,
                 "stage2_time": s2_time,
                 "stage2_energy": s2_energy,
+                "stage2_energy_kj_mol": s2_energy_kj_mol if s2_energy_kj_mol is not None else "",
+                "stage2_enthalpy_kj_mol": s2_enthalpy_kj_mol if s2_enthalpy_kj_mol is not None else "",
                 "stage2_density": s2_density,
                 "total_steps": s1_steps + s2_steps,
                 "total_time": s1_time + s2_time,
@@ -319,12 +328,16 @@ class Scheduler:
                         "stage1_steps",
                         "stage1_time",
                         "stage1_energy",
+                        "stage1_energy_kj_mol",
+                        "stage1_enthalpy_kj_mol",
                         "stage1_density",
                         "stage2_status",
                         "stage2_failed_reason",
                         "stage2_steps",
                         "stage2_time",
                         "stage2_energy",
+                        "stage2_energy_kj_mol",
+                        "stage2_enthalpy_kj_mol",
                         "stage2_density",
                         "total_steps",
                         "total_time",

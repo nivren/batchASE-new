@@ -473,6 +473,21 @@ class OptimizableBatch(Optimizable):
             return energies.view(-1)
         return energies
 
+    def get_internal_energies(self) -> torch.Tensor | NDArray:
+        """Get internal potential energy E for each system in batch (excluding PV term)."""
+        return self.get_potential_energies()
+
+    def get_pv_terms(self) -> torch.Tensor:
+        """Get PV work term for each system in batch (zeros for fixed cell)."""
+        energies = self.get_potential_energies()
+        if hasattr(energies, "device"):
+            return torch.zeros_like(energies)
+        return torch.zeros(len(energies), dtype=torch.float64)
+
+    def get_enthalpies(self) -> torch.Tensor:
+        """Get enthalpy H = E + PV for each system in batch."""
+        return self.get_internal_energies() + self.get_pv_terms()
+
     def get_cells(self) -> torch.Tensor:
         """Get batch crystallographic cells."""
         return self.batch.cell
@@ -924,12 +939,24 @@ class OptimizableUnitCellBatch(OptimizableBatch):
     def __len__(self):
         return len(self.batch.pos) + 3 * len(self.batch)
 
+    def get_internal_energies(self) -> torch.Tensor:
+        """Get internal potential energy E for each system in batch (excluding PV term)."""
+        energies = self.get_property("energy")
+        if hasattr(energies, "view"):
+            return energies.view(-1)
+        return energies
+
+    def get_pv_terms(self) -> torch.Tensor:
+        """Get PV work term for each system in batch."""
+        return self.pressure[0, 0] * self.get_volumes()
+
+    def get_enthalpies(self) -> torch.Tensor:
+        """Get enthalpy H = E + PV for each system in batch."""
+        return self.get_internal_energies() + self.get_pv_terms()
+
     def get_potential_energies(self) -> torch.Tensor:
-        """Get the predicted energy for each system in batch."""
-        return (
-            self.get_property("energy").view(-1)
-            + self.pressure[0, 0] * self.get_volumes()
-        )
+        """Get the optimization objective (enthalpy when pressure != 0)."""
+        return self.get_enthalpies()
 
 
 class OptimizableFrechetCellBatch(OptimizableBatch):
@@ -1265,9 +1292,21 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
     def __len__(self):
         return len(self.batch.pos) + 3 * len(self.batch)
 
+    def get_internal_energies(self) -> torch.Tensor:
+        """Get internal potential energy E for each system in batch (excluding PV term)."""
+        energies = self.get_property("energy")
+        if hasattr(energies, "view"):
+            return energies.view(-1)
+        return energies
+
+    def get_pv_terms(self) -> torch.Tensor:
+        """Get PV work term for each system in batch."""
+        return self.pressure[0, 0] * self.get_volumes()
+
+    def get_enthalpies(self) -> torch.Tensor:
+        """Get enthalpy H = E + PV for each system in batch."""
+        return self.get_internal_energies() + self.get_pv_terms()
+
     def get_potential_energies(self) -> torch.Tensor:
-        """Get the predicted energy for each system in batch."""
-        return (
-            self.get_property("energy").view(-1)
-            + self.pressure[0, 0] * self.get_volumes()
-        )
+        """Get the optimization objective (enthalpy when pressure != 0)."""
+        return self.get_enthalpies()
