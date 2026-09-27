@@ -3,6 +3,7 @@ from .optimizable import (
     OptimizableUnitCellBatch,
     OptimizableFrechetCellBatch,
 )
+from .status import SlotStatus, FailReason
 from .ase_utils import batch_to_atoms
 from .linalg import LinalgBackend
 from .optimizers import (
@@ -20,6 +21,8 @@ __all__ = [
     "OptimizableBatch",
     "OptimizableUnitCellBatch",
     "OptimizableFrechetCellBatch",
+    "SlotStatus",
+    "FailReason",
     "batch_to_atoms",
     "LinalgBackend",
     "BatchOptimizer",

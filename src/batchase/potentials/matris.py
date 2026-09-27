@@ -13,11 +13,7 @@ class MatRISBatchBackend:
     """MatRIS / MatGL potential adapter implementing BatchPotential."""
 
     def __init__(self, model_name: str = "default", device: str = "cuda", **kwargs):
-        self.kind = "matris"
-        self.device = torch.device(device)
-        self.dtype = torch.float32
-        self.r_max = 5.0
-        self._model_name = model_name
+        raise NotImplementedError("MatRISBatchBackend is currently a placeholder under active development.")
 
     def build_inputs(self, gbatch) -> dict:
         raise NotImplementedError("MatRISBatchBackend.build_inputs is under active development.")

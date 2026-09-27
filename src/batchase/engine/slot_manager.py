@@ -45,13 +45,13 @@ class SlotManager:
         batch_size: int,
         max_steps: int = 100,
         max_bnatoms: int = 8000,
-        molecule_single: int = 64,
+        molecule_single: Optional[int] = None,
     ) -> None:
         self.files = list(files)
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.max_bnatoms = max_bnatoms
-        self.molecule_single = molecule_single
+        self.molecule_single = int(molecule_single) if molecule_single is not None and int(molecule_single) > 0 else None
 
         self.pending_indices: int = 0
         self.slots: List[ActiveSlot] = []
@@ -121,13 +121,20 @@ class SlotManager:
 
             if is_converged or is_over_step:
                 runtime = now - slot.start_time
-                num_mol = len(slot.atoms) / self.molecule_single
-                energy_per_mol = (energies[i] / num_mol * 96.485) if num_mol > 0 else energies[i]
+                natoms = len(slot.atoms)
+                if self.molecule_single and natoms % self.molecule_single == 0:
+                    num_mol = natoms // self.molecule_single
+                    energy_per_mol = (energies[i] / num_mol * 96.485)
+                else:
+                    num_mol = None
+                    energy_per_mol = energies[i] * 96.485
                 record = {
                     "id": slot.id,
                     "path": slot.path,
                     "steps": slot.steps,
                     "runtime": runtime,
+                    "natoms": natoms,
+                    "num_molecules": num_mol,
                     "energy": energy_per_mol,
                     "converged": is_converged,
                     "atoms": slot.atoms,

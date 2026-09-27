@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*Please
 
 from .neighbors import AtomsToGraphs
 from .kernels import detect_optimal_backend, get_pbc_graph_kernel
-from .potentials import BatchPotential, MACEBatchBackend, create_backend
+from .potentials import BatchPotential, MACEBatchBackend, MockBatchBackend, create_backend
 from .relaxation import (
     OptimizableBatch,
     OptimizableUnitCellBatch,
@@ -38,6 +38,7 @@ __all__ = [
     "get_pbc_graph_kernel",
     "BatchPotential",
     "MACEBatchBackend",
+    "MockBatchBackend",
     "create_backend",
     "OptimizableBatch",
     "OptimizableUnitCellBatch",

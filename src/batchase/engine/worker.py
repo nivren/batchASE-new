@@ -47,13 +47,14 @@ class Worker:
         optimizer2: str = "BFGSFusedLS",
         skip_second_stage: bool = False,
         scalar_pressure: float = 0.0006,
-        molecule_single: int = 64,
+        molecule_single: Optional[int] = None,
         output_path: str = "./",
         model: str = "mace",
         use_fasteq: bool = False,
         cueq: bool = False,
         bfgs_cpu_thread: int = 1,
         worker_id: int = 0,
+        compile_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         if isinstance(files, (str, Path)):
@@ -79,12 +80,25 @@ class Worker:
         self.optimizer2 = optimizer2
         self.skip_second_stage = skip_second_stage
         self.scalar_pressure = scalar_pressure
-        self.molecule_single = molecule_single
+        mol_single_raw = molecule_single if molecule_single is not None else kwargs.get("molecule_single", None)
+        if mol_single_raw is None:
+            self.molecule_single = None
+        else:
+            try:
+                parsed_molecule_single = int(mol_single_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("molecule_single must be a positive integer or None") from exc
+            if parsed_molecule_single <= 0:
+                raise ValueError("molecule_single must be a positive integer or None")
+            self.molecule_single = parsed_molecule_single
         self.output_path = os.path.abspath(output_path)
         self.model = model
         self.use_fasteq = use_fasteq
         self.cueq = cueq
         self.bfgs_cpu_thread = bfgs_cpu_thread
+        self.compile_mode = compile_mode or kwargs.get("compile_mode", None)
+        self.f_upper_limit = float(kwargs.get("f_upper_limit", 100.0))
+        self.stage2_include_unconverged = bool(kwargs.get("stage2_include_unconverged", False))
         self.use_profiler = kwargs.get("use_profiler", False)
         self.profiler_log_dir = kwargs.get("profiler_log_dir", None)
         self.profiler_schedule_config = kwargs.get("profiler_schedule_config", None)
@@ -101,6 +115,8 @@ class Worker:
         """Compute crystal density in g/cm^3."""
         try:
             vol = atoms.get_volume()
+            if not np.isfinite(vol) or vol <= 1e-6:
+                return 0.0
             mass = sum(atoms.get_masses())
             return (mass / vol) * 1.66053906660
         except Exception:
@@ -128,12 +144,18 @@ class Worker:
         empty_metrics: Dict[str, Any] = {
             "structures": 0,
             "steps": 0,
+            "batch_iterations": 0,
             "elapsed_s": 0.0,
             "mace_s": 0.0,
             "opt_s": 0.0,
             "graph_s": 0.0,
             "io_s": 0.0,
             "peak_vram_gb": 0.0,
+            "max_structure_steps": 0,
+            "max_structure_file": "",
+            "max_structure_status": "",
+            "max_structure_failed_reason": "",
+            "max_structure_fmax": None,
         }
         if not files:
             return [], empty_metrics
@@ -169,19 +191,23 @@ class Worker:
             orig_cells = None
 
         opt_cls = get_optimizer_cls(optimizer_name)
+        optimizer_key = optimizer_name.lower()
         opt_kwargs = {
             "maxstep": 0.2,
             "early_stop": True,
-            "device": self.device,
-            "use_profiler": self.use_profiler,
-            "profiler_log_dir": self.profiler_log_dir,
-            "profiler_schedule_config": self.profiler_schedule_config,
+            "f_upper_limit": self.f_upper_limit,
         }
-        if optimizer_name == "BFGS":
+        if optimizer_key == "bfgs":
             opt_kwargs["alpha"] = 70.0
             opt_kwargs["bfgs_cpu_thread"] = self.bfgs_cpu_thread
-        elif optimizer_name in ("BFGSFusedLS", "BFGSLineSearch"):
-            opt_kwargs["alpha"] = 10.0
+        elif optimizer_key in ("bfgsfusedls", "bfgslinesearch"):
+            opt_kwargs.update(
+                alpha=10.0,
+                device=self.device,
+                use_profiler=self.use_profiler,
+                profiler_log_dir=self.profiler_log_dir,
+                profiler_schedule_config=self.profiler_schedule_config,
+            )
 
         batch_optimizer = opt_cls(obatch, **opt_kwargs)
 
@@ -196,6 +222,12 @@ class Worker:
         stage_mace_start = backend.mace_time
         stage_graph_start = backend.graph_time
         output_cif_paths = []
+        stage_success_cifs = []
+        max_structure_steps = 0
+        max_structure_file = ""
+        max_structure_status = ""
+        max_structure_failed_reason = ""
+        max_structure_fmax = None
 
         while converged_atoms_count < len(files):
             # Dynamic batch replenishment when structures finish
@@ -213,9 +245,9 @@ class Worker:
                 new_paths = files[indices_to_process : indices_to_process + num_needed]
                 indices_to_process += len(new_paths)
 
-                for np in new_paths:
-                    optimized_atoms_new.append(read(np))
-                    cur_batch_path_new.append(np)
+                for new_path in new_paths:
+                    optimized_atoms_new.append(read(new_path))
+                    cur_batch_path_new.append(new_path)
                     cur_batch_steps_new.append(0)
                     cur_batch_times_new.append(time.perf_counter())
 
@@ -282,9 +314,14 @@ class Worker:
                     is_restart_earlystop=True,
                     restart_indices=restart_indices,
                     old_batch_indices=old_batch_indices,
+                    f_upper_limit=self.f_upper_limit,
                 )
             else:
-                converge_indices = batch_optimizer.run(stage_fmax, remaining_steps)
+                converge_indices = batch_optimizer.run(
+                    stage_fmax,
+                    remaining_steps,
+                    f_upper_limit=self.f_upper_limit,
+                )
             t_burst_end = time.perf_counter()
             burst_duration = t_burst_end - t_burst_start
             total_burst_time += burst_duration
@@ -297,31 +334,88 @@ class Worker:
 
             # Update step count and detect completed/over-step slots
             cur_batch_steps = [s + burst_steps for s in cur_batch_steps]
+            failed_indices = getattr(obatch, "failed_indices_list", [])
+            failed_reasons = getattr(obatch, "failed_reasons", {})
             over_maxstep_indices = [
                 i for i, s in enumerate(cur_batch_steps) if s >= self.max_steps
             ]
-            all_indices = list(set(converge_indices + over_maxstep_indices))
+            all_indices = list(set(converge_indices + failed_indices + over_maxstep_indices))
 
             # Retrieve latest atoms and energies
             optimized_atoms = obatch.get_atoms_list()
+            def _to_flat_list(val):
+                if hasattr(val, "detach"):
+                    val = val.detach().cpu()
+                if hasattr(val, "view"):
+                    return val.view(-1).tolist()
+                elif isinstance(val, np.ndarray):
+                    return val.flatten().tolist()
+                elif hasattr(val, "tolist"):
+                    return val.tolist()
+                return list(val)
+
+            def _to_metric_list(val, default=None):
+                if val is None:
+                    return [default] * len(cur_batch_path)
+                if hasattr(val, "detach"):
+                    val = val.detach().cpu()
+                if hasattr(val, "reshape"):
+                    values = val.reshape(-1).tolist()
+                elif hasattr(val, "tolist"):
+                    values = val.tolist()
+                else:
+                    values = list(val)
+                result = []
+                for value in values[:len(cur_batch_path)]:
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        result.append(default)
+                        continue
+                    result.append(number if np.isfinite(number) else default)
+                result.extend([default] * (len(cur_batch_path) - len(result)))
+                return result
+
             raw_energies = obatch.get_potential_energies()
-            if hasattr(raw_energies, "view"):
-                energies_list = raw_energies.view(-1).tolist()
-            elif isinstance(raw_energies, np.ndarray):
-                energies_list = raw_energies.flatten().tolist()
-            elif hasattr(raw_energies, "tolist"):
-                energies_list = raw_energies.tolist()
+            energies_list = _to_flat_list(raw_energies)
+
+            if hasattr(obatch, "get_internal_energies"):
+                internal_energies_list = _to_flat_list(obatch.get_internal_energies())
             else:
-                energies_list = list(raw_energies)
+                internal_energies_list = energies_list
+
+            if hasattr(obatch, "get_pv_terms"):
+                pv_terms_list = _to_flat_list(obatch.get_pv_terms())
+            else:
+                pv_terms_list = [0.0] * len(energies_list)
+
+            if hasattr(obatch, "get_enthalpies"):
+                enthalpies_list = _to_flat_list(obatch.get_enthalpies())
+            else:
+                enthalpies_list = energies_list
 
             try:
-                max_forces_tensor = obatch.get_max_forces()
-                if hasattr(max_forces_tensor, "tolist"):
-                    max_forces_list = max_forces_tensor.detach().cpu().tolist()
-                else:
-                    max_forces_list = [float(f) for f in max_forces_tensor]
+                final_forces = obatch.get_forces(no_numpy=True)
+            except Exception:
+                final_forces = None
+
+            try:
+                max_forces_tensor = obatch.get_max_forces(final_forces)
+                max_forces_list = _to_metric_list(max_forces_tensor, default=0.0)
             except Exception:
                 max_forces_list = [0.0] * len(cur_batch_path)
+
+            try:
+                max_atom_forces = obatch.get_max_atom_forces(final_forces)
+                max_atom_forces_list = _to_metric_list(max_atom_forces)
+            except Exception:
+                max_atom_forces_list = [None] * len(cur_batch_path)
+
+            try:
+                max_stresses = obatch.get_max_stresses()
+                max_stresses_list = _to_metric_list(max_stresses)
+            except Exception:
+                max_stresses_list = [None] * len(cur_batch_path)
 
             cur_elapsed = max(time.perf_counter() - stage_start, 1e-6)
             cur_mace_time = max(0.0, backend.mace_time - stage_mace_start)
@@ -340,8 +434,25 @@ class Worker:
                 steps = cur_batch_steps[idx]
                 rate = steps / runtime
                 is_conv = idx in converge_indices
+                if is_conv:
+                    status = "converged"
+                    failed_reason = None
+                else:
+                    status = "failed"
+                    if idx in failed_indices:
+                        failed_reason = failed_reasons.get(idx, "unknown_failure")
+                    else:
+                        failed_reason = "max_steps"
+
                 conv_str = "YES" if is_conv else "NO"
                 fmax_val = max_forces_list[idx] if idx < len(max_forces_list) else 0.0
+                fmax_atom_val = max_atom_forces_list[idx] if idx < len(max_atom_forces_list) else None
+                fmax_stress_val = max_stresses_list[idx] if idx < len(max_stresses_list) else None
+                fmax_stress_gpa_val = (
+                    fmax_stress_val * 160.21766208
+                    if fmax_stress_val is not None
+                    else None
+                )
 
                 mace_s = runtime * mace_ratio
                 opt_s = runtime * opt_ratio
@@ -351,28 +462,101 @@ class Worker:
                 other_pct = other_ratio * 100.0
 
                 natoms = len(optimized_atoms[idx])
-                num_mol = natoms / self.molecule_single if self.molecule_single > 0 else 1.0
+                stem = Path(cur_batch_path[idx]).stem
+                if steps > max_structure_steps:
+                    max_structure_steps = steps
+                    max_structure_file = stem
+                    max_structure_status = status
+                    max_structure_failed_reason = failed_reason or ""
+                    max_structure_fmax = fmax_val
+                num_mol = None
+                energy_per_mol = None
+                normalization_status = "unnormalized"
+
+                if self.molecule_single is not None and self.molecule_single > 0:
+                    if natoms % self.molecule_single == 0:
+                        num_mol = natoms // self.molecule_single
+                        normalization_status = "normalized"
+                    else:
+                        normalization_status = "invalid_atom_count"
+                        logger.warning(
+                            f"{self.worker_tag} [{stem}] natoms ({natoms}) is not divisible by molecule_single "
+                            f"({self.molecule_single}). Cannot compute per-molecule energy."
+                        )
+
                 e_raw = energies_list[idx] if idx < len(energies_list) else 0.0
                 if isinstance(e_raw, (list, tuple)):
                     e_raw = e_raw[0]
                 e_val = float(e_raw)
-                energy_per_mol = (e_val / num_mol) * 96.485 if num_mol > 0 else e_val
+
+                e_int_raw = internal_energies_list[idx] if idx < len(internal_energies_list) else e_val
+                if isinstance(e_int_raw, (list, tuple)):
+                    e_int_raw = e_int_raw[0]
+                e_int_val = float(e_int_raw)
+
+                pv_raw = pv_terms_list[idx] if idx < len(pv_terms_list) else 0.0
+                if isinstance(pv_raw, (list, tuple)):
+                    pv_raw = pv_raw[0]
+                pv_val = float(pv_raw)
+
+                h_raw = enthalpies_list[idx] if idx < len(enthalpies_list) else e_val
+                if isinstance(h_raw, (list, tuple)):
+                    h_raw = h_raw[0]
+                h_val = float(h_raw)
+
+                if num_mol is not None and num_mol > 0:
+                    energy_kj_mol = (e_int_val / num_mol) * 96.485
+                    enthalpy_kj_mol = (h_val / num_mol) * 96.485
+                    energy_per_mol = (e_val / num_mol) * 96.485
+                else:
+                    energy_kj_mol = None
+                    enthalpy_kj_mol = None
+                    energy_per_mol = None
+
+                energy_out = (e_val / num_mol * 96.485) if (num_mol is not None and num_mol > 0) else e_val * 96.485
+
                 density = self._get_density(optimized_atoms[idx])
 
-                stem = Path(cur_batch_path[idx]).stem
                 out_cif = os.path.join(cif_dir, f"{stem}.cif")
                 out_json = os.path.join(json_dir, f"{stem}.json")
 
-                optimized_atoms[idx].write(out_cif)
-                output_cif_paths.append(out_cif)
+                cif_written = False
+                try:
+                    if is_conv or (status != "failed") or (failed_reason not in ("nan_force", "invalid_cell")):
+                        optimized_atoms[idx].write(out_cif)
+                        output_cif_paths.append(out_cif)
+                        cif_written = True
+                except Exception as e:
+                    logger.warning(f"Could not write CIF for {stem}: {e}")
+
+                # Stage 2 qualification: only converged structures (or optionally max_steps) proceed
+                can_proceed = is_conv or (self.stage2_include_unconverged and failed_reason == "max_steps")
+                if can_proceed and cif_written:
+                    stage_success_cifs.append(out_cif)
 
                 result_data = {
                     "file": stem,
+                    "status": status,
                     "converged": is_conv,
+                    "failed_reason": failed_reason,
                     "fmax": fmax_val,
+                    "fmax_atom": fmax_atom_val,
+                    "fmax_stress": fmax_stress_val,
+                    "fmax_stress_gpa": fmax_stress_gpa_val,
                     "steps": steps,
                     "runtime": runtime,
-                    "energy": energy_per_mol,
+                    "natoms": natoms,
+                    "molecule_single": self.molecule_single,
+                    "num_molecules": num_mol,
+                    "normalization_status": normalization_status,
+                    "energy_raw_ev": e_val,
+                    "internal_energy_raw_ev": e_int_val,
+                    "enthalpy_raw_ev": h_val,
+                    "pv_raw_ev": pv_val,
+                    "energy_kj_mol": energy_kj_mol,
+                    "enthalpy_kj_mol": enthalpy_kj_mol,
+                    "energy_per_mol": energy_per_mol,
+                    "energy": energy_out,
                     "density": density,
                     "mace_time": mace_s,
                     "opt_time": opt_s,
@@ -381,9 +565,17 @@ class Worker:
                 with open(out_json, "w", encoding="utf-8") as f:
                     json.dump(result_data, f, indent=2)
 
+                fail_msg = f" fail_reason={failed_reason}" if not is_conv else ""
+                atom_text = f"{fmax_atom_val:.4f}" if fmax_atom_val is not None else "n/a"
+                stress_text = (
+                    f"{fmax_stress_gpa_val:.3f}GPa"
+                    if fmax_stress_gpa_val is not None
+                    else "n/a"
+                )
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] DONE {stem}: "
-                    f"conv={conv_str} steps={steps} ({rate:.1f} st/s) fmax={fmax_val:.4f} t={runtime:.1f}s "
+                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) "
+                    f"fmax={fmax_val:.4f} (atom={atom_text}, stress={stress_text}) t={runtime:.1f}s "
                     f"[mace:{mace_s:.1f}s({mace_pct:.1f}%) opt:{opt_s:.1f}s({opt_pct:.1f}%) other:{other_s:.1f}s({other_pct:.1f}%)]"
                 )
 
@@ -391,10 +583,8 @@ class Worker:
 
             now = time.perf_counter()
             if (converged_atoms_count > 0 and converged_atoms_count % 20 == 0) or (now - last_heartbeat >= 30.0):
-                stage_elapsed = max(now - stage_start, 1e-6)
                 surviving_count = len(cur_batch_path) - len(all_indices)
                 active_slots = surviving_count if converged_atoms_count < len(files) else 0
-                worker_rate = total_steps_in_stage / stage_elapsed
                 vram_gb = (
                     torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
                     if str(self.device).startswith("cuda")
@@ -403,7 +593,7 @@ class Worker:
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] progress: {converged_atoms_count}/{len(files)} done | "
                     f"active_slots: {active_slots}/{self.batch_size} | "
-                    f"avg_rate: {worker_rate:.1f} st/s | peak_vram: {vram_gb:.2f} GB"
+                    f"peak_vram: {vram_gb:.2f} GB"
                 )
                 last_heartbeat = now
 
@@ -412,7 +602,6 @@ class Worker:
         final_graph_time = max(0.0, backend.graph_time - stage_graph_start)
         final_opt_time = max(0.0, total_burst_time - (final_mace_time + final_graph_time))
         final_io_time = max(0.0, stage_total_time - total_burst_time)
-        stage_rate = total_steps_in_stage / stage_total_time
         vram_gb = (
             torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
             if str(self.device).startswith("cuda")
@@ -420,19 +609,27 @@ class Worker:
         )
         logger.info(
             f"{self.worker_tag} [{stage_name}] completed: {len(files)} structures in {stage_total_time:.2f}s "
-            f"({total_steps_in_stage} steps, {stage_rate:.1f} st/s, peak_vram: {vram_gb:.2f} GB)"
+            f"({len(stage_success_cifs)} qualified for next stage, peak_vram: {vram_gb:.2f} GB)"
         )
         stage_metrics = {
             "structures": len(files),
+            "converged": len(stage_success_cifs),
+            "output_cifs": len(output_cif_paths),
             "steps": total_steps_in_stage,
+            "batch_iterations": total_steps_in_stage,
             "elapsed_s": stage_total_time,
             "mace_s": final_mace_time,
             "opt_s": final_opt_time,
             "graph_s": final_graph_time,
             "io_s": final_io_time,
             "peak_vram_gb": vram_gb,
+            "max_structure_steps": max_structure_steps,
+            "max_structure_file": max_structure_file,
+            "max_structure_status": max_structure_status,
+            "max_structure_failed_reason": max_structure_failed_reason,
+            "max_structure_fmax": max_structure_fmax,
         }
-        return output_cif_paths, stage_metrics
+        return stage_success_cifs, stage_metrics
 
     def run(self) -> None:
         """Run complete 2-stage or 1-stage relaxation pipeline."""
@@ -443,6 +640,7 @@ class Worker:
             device=self.device,
             enable_cueq=self.cueq,
             use_fasteq=self.use_fasteq,
+            compile_mode=self.compile_mode,
         )
 
         worker_start_time = time.perf_counter()
@@ -482,7 +680,9 @@ class Worker:
             else 0.0
         )
 
-        total_steps = sum(m.get("steps", 0) for m in stages_dict.values())
+        total_batch_iterations = sum(
+            m.get("batch_iterations", m.get("steps", 0)) for m in stages_dict.values()
+        )
         total_mace = sum(m.get("mace_s", 0.0) for m in stages_dict.values())
         total_opt = sum(m.get("opt_s", 0.0) for m in stages_dict.values())
         total_graph = sum(m.get("graph_s", 0.0) for m in stages_dict.values())
@@ -493,7 +693,8 @@ class Worker:
             "device": str(self.device),
             "stages": stages_dict,
             "total_elapsed_s": total_elapsed,
-            "total_steps": total_steps,
+            "total_steps": total_batch_iterations,
+            "total_batch_iterations": total_batch_iterations,
             "mace_s": total_mace,
             "opt_s": total_opt,
             "graph_s": total_graph,

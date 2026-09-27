@@ -15,11 +15,6 @@ from typing import TYPE_CHECKING
 import ase
 import torch
 
-try:
-    from torch_scatter import scatter
-except ImportError:
-    scatter = None
-
 if TYPE_CHECKING:
     from ..optimizable import OptimizableBatch
 
@@ -38,6 +33,7 @@ class LBFGS:
         traj_dir: Path | None = None,
         traj_names: list[str] | None = None,
         early_stop: bool = False,
+        f_upper_limit: float = 100.0,
     ) -> None:
         """
         Args:
@@ -75,10 +71,13 @@ class LBFGS:
         ), "Trajectory names should be specified to save trajectories"
 
         self.early_stop  = early_stop
+        self.f_upper_limit = f_upper_limit
 
-    def run(self, fmax, steps):
+    def run(self, fmax, steps, f_upper_limit=None):
         self.fmax = fmax
         self.steps = steps
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         self.s.clear()
         self.y.clear()
@@ -99,12 +98,13 @@ class LBFGS:
         # print("Step   Fmax(eV/A)")
 
         while iteration < steps and not self.optimizable.converged(
-            forces=None, fmax=self.fmax, max_forces=max_forces
+            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
         ):
 
             if self.early_stop:
                 converge_indices_list = self.optimizable.converge_indices_list
-                if len(converge_indices_list) > 0:
+                failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
+                if len(converge_indices_list) > 0 or len(failed_indices_list) > 0:
                     logging.debug(f"Early stopping at iteration {iteration}")
                     break
 
@@ -159,62 +159,49 @@ class LBFGS:
             setattr(self.optimizable.batch, name, value)
 
         self.nsteps = iteration
+        self.converge_indices_list = self.optimizable.converge_indices_list
+        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
 
         if self.early_stop:
-            converge_indices_list = self.optimizable.converge_indices_list
-            return converge_indices_list
+            return self.converge_indices_list
         else:
             return self.optimizable.converged(
-                forces=None, fmax=self.fmax, max_forces=max_forces
+                forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
             )
 
     def determine_step(self, dr):
         steplengths = torch.norm(dr, dim=1)
-        if device == 'cuda':
-            longest_steps = scatter(
-                steplengths, self.optimizable.batch_indices, reduce="max"
-            )
-        else:
-            index = self.optimizable.batch_indices
-            src = steplengths
-
-            num_groups = int(index.max().item()) + 1
-
-            out = torch.full(
-                (num_groups,),
-                float('-inf'),
-                device=src.device,
-                dtype=src.dtype
-            )
-
-            longest_steps = out.scatter_reduce(
-                dim=0,
-                index=index,
-                src=src,
-                reduce="amax",
-                include_self=True
-            )
-        longest_steps = longest_steps[self.optimizable.batch_indices]
+        index = self.optimizable.batch_indices
+        longest_steps = torch.full(
+            (self.optimizable.batch_size,),
+            float("-inf"),
+            device=steplengths.device,
+            dtype=steplengths.dtype,
+        ).scatter_reduce(
+            dim=0,
+            index=index,
+            src=steplengths,
+            reduce="amax",
+            include_self=True,
+        )
+        longest_steps = longest_steps[index]
         maxstep = longest_steps.new_tensor(self.maxstep)
-        # scale = (longest_steps + 1e-7).reciprocal() * torch.min(longest_steps, maxstep)
-        scale = (longest_steps).reciprocal() * torch.min(longest_steps, maxstep)
+        scale = torch.clamp(
+            maxstep / torch.clamp(longest_steps, min=1e-12),
+            max=1.0,
+        )
         dr *= scale.unsqueeze(1)
         return dr * self.damping
 
     def _batched_dot(self, x: torch.Tensor, y: torch.Tensor):
-        if device == 'cuda':
-            return scatter(
-                (x * y).sum(dim=-1), self.optimizable.batch_indices, reduce="sum"
-            )
-        else:
-            index = self.optimizable.batch_indices
-            src = (x * y).sum(dim=-1)   # shape: (N,)
-            num_groups = int(index.max().item()) + 1
-            out = torch.zeros(
-                num_groups, device=src.device, dtype=src.dtype
-            )
-            out.scatter_add_(dim=0, index=index, src=src)
-            return out
+        index = self.optimizable.batch_indices
+        src = (x * y).sum(dim=-1)
+        out = torch.zeros(
+            self.optimizable.batch_size,
+            device=src.device,
+            dtype=src.dtype,
+        )
+        return out.scatter_add_(dim=0, index=index, src=src)
 
     def step(self, iteration: int) -> None:
         # cast forces and positions to float64 otherwise the algorithm is prone to overflow

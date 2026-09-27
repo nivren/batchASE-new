@@ -13,12 +13,7 @@ class SevenNetBatchBackend:
     """SevenNet potential adapter implementing BatchPotential."""
 
     def __init__(self, model_name: str = "7net-0", device: str = "cuda", **kwargs):
-        self.kind = "sevennet"
-        self.device = torch.device(device)
-        self.dtype = torch.float32
-        self.r_max = 5.0
-        # Placeholder for full SevenNet calculator integration
-        self._model_name = model_name
+        raise NotImplementedError("SevenNetBatchBackend is currently a placeholder under active development.")
 
     def build_inputs(self, gbatch) -> dict:
         raise NotImplementedError("SevenNetBatchBackend.build_inputs is under active development.")

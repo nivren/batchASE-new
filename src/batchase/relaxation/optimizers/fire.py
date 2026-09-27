@@ -14,13 +14,6 @@ import torch
 from ..optimizable import OptimizableBatch
 from .base import BatchOptimizer
 
-try:
-    from torch_scatter import scatter
-    _has_scatter = True
-except ImportError:
-    scatter = None
-    _has_scatter = False
-
 logger = logging.getLogger("batchase.optimizers.fire")
 
 
@@ -41,12 +34,9 @@ def _batched_dot_per_system(
         [B] dot product per system
     """
     prod = (x * y).sum(dim=-1)  # [N]
-    if _has_scatter and prod.is_cuda:
-        return scatter(prod, batch_indices, dim=0, dim_size=num_systems, reduce="sum")
-    out = torch.zeros((num_systems,), device=prod.device, dtype=prod.dtype).scatter_add_(
-        0, batch_indices, prod
-    )
-    return out
+    return torch.zeros(
+        (num_systems,), device=prod.device, dtype=prod.dtype
+    ).scatter_add_(0, batch_indices, prod)
 
 
 def _batched_norm_per_system(
@@ -89,6 +79,7 @@ class _BatchFIREBase(BatchOptimizer):
         flavor: str = "fire",
         force_reeval: bool = True,
         early_stop: bool = False,
+        f_upper_limit: float = 100.0,
         **kwargs,
     ) -> None:
         super().__init__(optimizable=optimizable, maxstep=maxstep)
@@ -103,6 +94,7 @@ class _BatchFIREBase(BatchOptimizer):
         self.flavor = flavor.lower()
         self.force_reeval = force_reeval
         self.early_stop = early_stop
+        self.f_upper_limit = f_upper_limit
 
         self.device = torch.device(self.optimizable.device)
         self.dtype = self.optimizable.dtype
@@ -224,7 +216,12 @@ class _BatchFIREBase(BatchOptimizer):
                 neg_atoms = neg_mask[batch_idx]
                 self.v[neg_atoms] = 0.0
                 self.a[neg_mask] = self.astart
-                self.dt[neg_mask] = torch.maximum(self.dt[neg_mask] * self.fdec, dt_min_t)
+                # ASE native FIRE has no dtmin lower bound; only clamp when
+                # dtmin > 0 (i.e. when used via FIRE2 flavor).
+                new_dt = self.dt[neg_mask] * self.fdec
+                if self.dtmin > 0:
+                    new_dt = torch.maximum(new_dt, dt_min_t)
+                self.dt[neg_mask] = new_dt
                 self.Nsteps[neg_mask] = 0
 
             # 3. Acceleration (Euler)
@@ -309,10 +306,13 @@ class _BatchFIREBase(BatchOptimizer):
         is_restart_earlystop: bool = False,
         restart_indices: Optional[List[int]] = None,
         old_batch_indices: Optional[torch.Tensor] = None,
+        f_upper_limit: Optional[float] = None,
     ) -> Union[List[int], bool]:
         """Run optimizer until convergence or steps is reached."""
         self.fmax = fmax
         self.max_iter = steps
+        if f_upper_limit is not None:
+            self.f_upper_limit = f_upper_limit
 
         if (
             is_restart_earlystop
@@ -325,11 +325,12 @@ class _BatchFIREBase(BatchOptimizer):
         max_forces = self.optimizable.get_max_forces(apply_constraint=True)
 
         while iteration < self.max_iter and not self.optimizable.converged(
-            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=1e25
+            forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit
         ):
             if self.early_stop and iteration > 0:
                 converge_indices = self.optimizable.converge_indices_list
-                if len(converge_indices) > 0:
+                failed_indices = getattr(self.optimizable, "failed_indices_list", [])
+                if len(converge_indices) > 0 or len(failed_indices) > 0:
                     break
 
             self.step(fmax=self.fmax)
@@ -337,9 +338,11 @@ class _BatchFIREBase(BatchOptimizer):
             iteration += 1
 
         self.nsteps = iteration
+        self.converge_indices_list = self.optimizable.converge_indices_list
+        self.failed_indices_list = getattr(self.optimizable, "failed_indices_list", [])
         if self.early_stop:
-            return self.optimizable.converge_indices_list
-        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces)
+            return self.converge_indices_list
+        return self.optimizable.converged(forces=None, fmax=self.fmax, max_forces=max_forces, f_upper_limit=self.f_upper_limit)
 
 
 class FIRE(_BatchFIREBase):
@@ -356,7 +359,7 @@ class FIRE(_BatchFIREBase):
         dt: float = 0.1,
         maxstep: float = 0.2,
         dtmax: float = 1.0,
-        dtmin: float = 2e-3,
+        dtmin: float = 0.0,
         Nmin: int = 5,
         finc: float = 1.1,
         fdec: float = 0.5,

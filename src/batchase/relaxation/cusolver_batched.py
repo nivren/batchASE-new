@@ -157,6 +157,57 @@ def _get_device_context(device: torch.device) -> _DeviceContext:
     return _DEVICE_CONTEXTS[dev_idx]
 
 
+def _recover_failed_slices(
+    A: torch.Tensor,
+    eigenvalues: torch.Tensor,
+    eigenvectors: torch.Tensor,
+    info: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    finite_values = torch.isfinite(eigenvalues).all(dim=-1)
+    finite_vectors = torch.isfinite(eigenvectors).all(dim=-1).all(dim=-1)
+    nonfinite_mask = ~(finite_values & finite_vectors)
+    failed_mask = info.ne(0) | nonfinite_mask
+
+    if not failed_mask.any().item():
+        return eigenvalues, eigenvectors
+
+    failed_indices = torch.nonzero(failed_mask, as_tuple=False).flatten()
+    failed_indices_list = failed_indices.detach().cpu().tolist()
+    info_codes = info.index_select(0, failed_indices).detach().cpu().tolist()
+    nonfinite_indices = (
+        torch.nonzero(nonfinite_mask, as_tuple=False).flatten().detach().cpu().tolist()
+    )
+    logger.warning(
+        "cusolver_syevj_batched: recovering failed slices; "
+        "batch_size=%d indices=%s info=%s nonfinite_indices=%s",
+        A.shape[0],
+        failed_indices_list,
+        info_codes,
+        nonfinite_indices,
+    )
+
+    failed_matrices = A.index_select(0, failed_indices)
+    try:
+        fallback_values, fallback_vectors = torch.linalg.eigh(failed_matrices)
+        fallback_is_finite = (
+            torch.isfinite(fallback_values).all()
+            and torch.isfinite(fallback_vectors).all()
+        )
+        if not fallback_is_finite:
+            raise RuntimeError("torch.linalg.eigh returned non-finite values")
+    except Exception as exc:
+        message = (
+            "cusolver_syevj_batched fallback failed for "
+            f"indices={failed_indices_list}, info={info_codes}: {exc}"
+        )
+        logger.error(message)
+        raise RuntimeError(message) from exc
+
+    eigenvalues.index_copy_(0, failed_indices, fallback_values)
+    eigenvectors.index_copy_(0, failed_indices, fallback_vectors)
+    return eigenvalues, eigenvectors
+
+
 def cusolver_syevj_batched(
     A: torch.Tensor,
     tolerance: Optional[float] = None,
@@ -288,4 +339,4 @@ def cusolver_syevj_batched(
     # In PyTorch C-contiguous row-major layout, this corresponds to A_work.transpose(-1, -2).
     # Thus V = A_work.transpose(-1, -2) yields column-vector eigenvectors matching torch.linalg.eigh.
     V = A_work.transpose(-1, -2)
-    return W, V
+    return _recover_failed_slices(A, W, V, info)
