@@ -74,6 +74,7 @@ class Scheduler:
         cueq: bool = False,
         molecule_single: int = 64,
         bfgs_cpu_thread: int = 1,
+        compile_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         self.files = list(files)
@@ -96,6 +97,7 @@ class Scheduler:
         self.cueq = cueq
         self.molecule_single = molecule_single
         self.bfgs_cpu_thread = bfgs_cpu_thread
+        self.compile_mode = compile_mode or kwargs.pop("compile_mode", None)
 
         self.bind_cores = kwargs.pop("bind_cores", None)
         self.cpu_masks = self._parse_bind_cores(self.bind_cores)
@@ -193,6 +195,7 @@ class Scheduler:
                 "use_fasteq": self.use_fasteq,
                 "cueq": self.cueq,
                 "bfgs_cpu_thread": self.bfgs_cpu_thread,
+                "compile_mode": self.compile_mode,
                 "use_profiler": self.use_profiler,
                 "profiler_log_dir": self.profiler_log_dir,
                 "profiler_schedule_config": self.profiler_schedule_config,

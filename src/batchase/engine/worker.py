@@ -54,6 +54,7 @@ class Worker:
         cueq: bool = False,
         bfgs_cpu_thread: int = 1,
         worker_id: int = 0,
+        compile_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         if isinstance(files, (str, Path)):
@@ -85,6 +86,7 @@ class Worker:
         self.use_fasteq = use_fasteq
         self.cueq = cueq
         self.bfgs_cpu_thread = bfgs_cpu_thread
+        self.compile_mode = compile_mode or kwargs.get("compile_mode", None)
         self.f_upper_limit = float(kwargs.get("f_upper_limit", 100.0))
         self.stage2_include_unconverged = bool(kwargs.get("stage2_include_unconverged", False))
         self.use_profiler = kwargs.get("use_profiler", False)
@@ -485,6 +487,7 @@ class Worker:
             device=self.device,
             enable_cueq=self.cueq,
             use_fasteq=self.use_fasteq,
+            compile_mode=self.compile_mode,
         )
 
         worker_start_time = time.perf_counter()

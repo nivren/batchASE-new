@@ -61,6 +61,7 @@ class MACEBatchBackend:
         use_fasteq: bool = False,
         neighbor: str = "auto",
         use_compile: bool = False,
+        compile_mode: Optional[str] = None,
         calculator=None,
         **mace_kwargs,
     ):
@@ -69,7 +70,9 @@ class MACEBatchBackend:
         self.default_dtype = default_dtype
         self.dtype = torch.float64 if default_dtype == "float64" else torch.float32
         self.device = torch.device(device)
-        self.use_compile = use_compile
+        effective_compile_mode = compile_mode if compile_mode is not None else ("default" if use_compile else None)
+        self.compile_mode = effective_compile_mode
+        self.use_compile = effective_compile_mode is not None
 
         # Process-level FastEq switch in cuequivariance_torch
         try:
@@ -83,13 +86,34 @@ class MACEBatchBackend:
             from mace.calculators import mace_off
             # Device passed to mace_off must be "cuda" without index for conv_fusion=(device=="cuda")
             _mace_dev = str(device).split(":")[0] if str(device).startswith("cuda") else str(device)
-            calculator = mace_off(
-                model=model,
-                device=_mace_dev,
-                default_dtype=default_dtype,
-                enable_cueq=enable_cueq,
-                **mace_kwargs,
-            )
+            try:
+                calculator = mace_off(
+                    model=model,
+                    device=_mace_dev,
+                    default_dtype=default_dtype,
+                    enable_cueq=enable_cueq,
+                    compile_mode=effective_compile_mode,
+                    **mace_kwargs,
+                )
+            except Exception as e:
+                if effective_compile_mode is not None:
+                    logger.warning(
+                        "Failed to initialize MACE with compile_mode=%s: %s. Falling back to uncompiled model.",
+                        effective_compile_mode,
+                        e,
+                    )
+                    self.use_compile = False
+                    self.compile_mode = None
+                    calculator = mace_off(
+                        model=model,
+                        device=_mace_dev,
+                        default_dtype=default_dtype,
+                        enable_cueq=enable_cueq,
+                        compile_mode=None,
+                        **mace_kwargs,
+                    )
+                else:
+                    raise
         self.calculator = calculator
         self.model = calculator.models[0]
         self.z_table = calculator.z_table
@@ -103,13 +127,14 @@ class MACEBatchBackend:
         self.forward_calls: int = 0
 
         logger.info(
-            "MACEBatchBackend initialized: device=%s dtype=%s r_max=%.2f neighbor=%s enable_cueq=%s use_fasteq=%s",
+            "MACEBatchBackend initialized: device=%s dtype=%s r_max=%.2f neighbor=%s enable_cueq=%s use_fasteq=%s compile_mode=%s",
             self.device,
             self.dtype,
             self.r_max,
             self.neighbor,
             enable_cueq,
             use_fasteq,
+            self.compile_mode,
         )
 
     def _run_neighbor_kernel(self, pos, cell, natoms, atomic_numbers, batch, ptr):
@@ -198,7 +223,7 @@ class MACEBatchBackend:
         out = self.model(
             inputs,
             compute_stress=compute_stress,
-            training=self.use_compile,
+            training=False,
         )
         results = {
             "energy": out["energy"].unsqueeze(-1).detach().to(torch.float64),
