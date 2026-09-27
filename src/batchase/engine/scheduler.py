@@ -328,11 +328,17 @@ class Scheduler:
             s1_energy = float(s1_data.get("energy", 0.0))
             s1_density = float(s1_data.get("density", 0.0))
             s1_fmax = s1_data.get("fmax")
+            s1_fmax_atom = s1_data.get("fmax_atom")
+            s1_fmax_stress = s1_data.get("fmax_stress")
+            s1_fmax_stress_gpa = s1_data.get("fmax_stress_gpa")
             s2_steps = int(s2_data.get("steps", 0))
             s2_time = float(s2_data.get("runtime", 0.0))
             s2_energy = float(s2_data.get("energy", 0.0))
             s2_density = float(s2_data.get("density", 0.0))
             s2_fmax = s2_data.get("fmax")
+            s2_fmax_atom = s2_data.get("fmax_atom")
+            s2_fmax_stress = s2_data.get("fmax_stress")
+            s2_fmax_stress_gpa = s2_data.get("fmax_stress_gpa")
 
             s1_status = s1_data.get("status", "converged" if s1_data.get("converged") else "failed")
             s1_failed_reason = s1_data.get("failed_reason") or ""
@@ -371,6 +377,9 @@ class Scheduler:
                 "stage1_enthalpy_kj_mol": s1_enthalpy_kj_mol if s1_enthalpy_kj_mol is not None else "",
                 "stage1_density": s1_density,
                 "stage1_fmax": s1_fmax if s1_fmax is not None else "",
+                "stage1_fmax_atom": s1_fmax_atom if s1_fmax_atom is not None else "",
+                "stage1_fmax_stress": s1_fmax_stress if s1_fmax_stress is not None else "",
+                "stage1_fmax_stress_gpa": s1_fmax_stress_gpa if s1_fmax_stress_gpa is not None else "",
                 "stage2_status": s2_status,
                 "stage2_failed_reason": s2_failed_reason,
                 "stage2_steps": s2_steps,
@@ -380,6 +389,9 @@ class Scheduler:
                 "stage2_enthalpy_kj_mol": s2_enthalpy_kj_mol if s2_enthalpy_kj_mol is not None else "",
                 "stage2_density": s2_density,
                 "stage2_fmax": s2_fmax if s2_fmax is not None else "",
+                "stage2_fmax_atom": s2_fmax_atom if s2_fmax_atom is not None else "",
+                "stage2_fmax_stress": s2_fmax_stress if s2_fmax_stress is not None else "",
+                "stage2_fmax_stress_gpa": s2_fmax_stress_gpa if s2_fmax_stress_gpa is not None else "",
                 "total_steps": s1_steps + s2_steps,
                 "total_time": s1_time + s2_time,
             })
@@ -404,6 +416,9 @@ class Scheduler:
                         "stage1_enthalpy_kj_mol",
                         "stage1_density",
                         "stage1_fmax",
+                        "stage1_fmax_atom",
+                        "stage1_fmax_stress",
+                        "stage1_fmax_stress_gpa",
                         "stage2_status",
                         "stage2_failed_reason",
                         "stage2_steps",
@@ -413,6 +428,9 @@ class Scheduler:
                         "stage2_enthalpy_kj_mol",
                         "stage2_density",
                         "stage2_fmax",
+                        "stage2_fmax_atom",
+                        "stage2_fmax_stress",
+                        "stage2_fmax_stress_gpa",
                         "total_steps",
                         "total_time",
                     ],
@@ -434,6 +452,8 @@ class Scheduler:
 
         density_values = []
         fmax_values = []
+        atom_fmax_values = []
+        stress_gpa_values = []
         for record in converged:
             density = _finite_float(record.get(f"{stage}_density"), positive=True)
             if density is not None:
@@ -441,6 +461,12 @@ class Scheduler:
             fmax = _finite_float(record.get(f"{stage}_fmax"))
             if fmax is not None and fmax >= 0.0:
                 fmax_values.append(fmax)
+            atom_fmax = _finite_float(record.get(f"{stage}_fmax_atom"))
+            if atom_fmax is not None and atom_fmax >= 0.0:
+                atom_fmax_values.append(atom_fmax)
+            stress_gpa = _finite_float(record.get(f"{stage}_fmax_stress_gpa"))
+            if stress_gpa is not None and stress_gpa >= 0.0:
+                stress_gpa_values.append(stress_gpa)
 
         pressure = _finite_float(self.scalar_pressure) or 0.0
         if has_stage2 or abs(pressure) <= 0.0:
@@ -461,6 +487,8 @@ class Scheduler:
 
         density_stats = _summary_stats(density_values)
         fmax_stats = _summary_stats(fmax_values)
+        atom_fmax_stats = _summary_stats(atom_fmax_values)
+        stress_gpa_stats = _summary_stats(stress_gpa_values)
         energy_stats = _summary_stats(energy_values)
         stage1_attempted = [record for record in records if _stage_attempted(record, "stage1")]
         stage1_converged = sum(
@@ -494,6 +522,24 @@ class Scheduler:
                 f"median={fmax_stats['median']:.6f} p95={_percentile(fmax_values, 0.95):.6f} "
                 f"max={fmax_stats['max']:.6f} below_target={sum(value <= target_fmax for value in fmax_values)}/{len(fmax_values)} "
                 f"(target={target_fmax:.6f})"
+            )
+
+        if atom_fmax_stats is None:
+            lines.append("  Final atom fmax [eV/A]: unavailable")
+        else:
+            lines.append(
+                f"  Final atom fmax [eV/A]: n={atom_fmax_stats['count']} "
+                f"median={atom_fmax_stats['median']:.6f} p95={_percentile(atom_fmax_values, 0.95):.6f} "
+                f"max={atom_fmax_stats['max']:.6f}"
+            )
+
+        if stress_gpa_stats is None:
+            lines.append("  Final stress [GPa]   : unavailable")
+        else:
+            lines.append(
+                f"  Final stress [GPa]   : n={stress_gpa_stats['count']} "
+                f"median={stress_gpa_stats['median']:.6f} p95={_percentile(stress_gpa_values, 0.95):.6f} "
+                f"max={stress_gpa_stats['max']:.6f}"
             )
 
         if density_stats is None:

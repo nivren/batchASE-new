@@ -245,9 +245,9 @@ class Worker:
                 new_paths = files[indices_to_process : indices_to_process + num_needed]
                 indices_to_process += len(new_paths)
 
-                for np in new_paths:
-                    optimized_atoms_new.append(read(np))
-                    cur_batch_path_new.append(np)
+                for new_path in new_paths:
+                    optimized_atoms_new.append(read(new_path))
+                    cur_batch_path_new.append(new_path)
                     cur_batch_steps_new.append(0)
                     cur_batch_times_new.append(time.perf_counter())
 
@@ -354,6 +354,28 @@ class Worker:
                     return val.tolist()
                 return list(val)
 
+            def _to_metric_list(val, default=None):
+                if val is None:
+                    return [default] * len(cur_batch_path)
+                if hasattr(val, "detach"):
+                    val = val.detach().cpu()
+                if hasattr(val, "reshape"):
+                    values = val.reshape(-1).tolist()
+                elif hasattr(val, "tolist"):
+                    values = val.tolist()
+                else:
+                    values = list(val)
+                result = []
+                for value in values[:len(cur_batch_path)]:
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        result.append(default)
+                        continue
+                    result.append(number if np.isfinite(number) else default)
+                result.extend([default] * (len(cur_batch_path) - len(result)))
+                return result
+
             raw_energies = obatch.get_potential_energies()
             energies_list = _to_flat_list(raw_energies)
 
@@ -373,13 +395,27 @@ class Worker:
                 enthalpies_list = energies_list
 
             try:
-                max_forces_tensor = obatch.get_max_forces()
-                if hasattr(max_forces_tensor, "tolist"):
-                    max_forces_list = max_forces_tensor.detach().cpu().tolist()
-                else:
-                    max_forces_list = [float(f) for f in max_forces_tensor]
+                final_forces = obatch.get_forces(no_numpy=True)
+            except Exception:
+                final_forces = None
+
+            try:
+                max_forces_tensor = obatch.get_max_forces(final_forces)
+                max_forces_list = _to_metric_list(max_forces_tensor, default=0.0)
             except Exception:
                 max_forces_list = [0.0] * len(cur_batch_path)
+
+            try:
+                max_atom_forces = obatch.get_max_atom_forces(final_forces)
+                max_atom_forces_list = _to_metric_list(max_atom_forces)
+            except Exception:
+                max_atom_forces_list = [None] * len(cur_batch_path)
+
+            try:
+                max_stresses = obatch.get_max_stresses()
+                max_stresses_list = _to_metric_list(max_stresses)
+            except Exception:
+                max_stresses_list = [None] * len(cur_batch_path)
 
             cur_elapsed = max(time.perf_counter() - stage_start, 1e-6)
             cur_mace_time = max(0.0, backend.mace_time - stage_mace_start)
@@ -410,6 +446,13 @@ class Worker:
 
                 conv_str = "YES" if is_conv else "NO"
                 fmax_val = max_forces_list[idx] if idx < len(max_forces_list) else 0.0
+                fmax_atom_val = max_atom_forces_list[idx] if idx < len(max_atom_forces_list) else None
+                fmax_stress_val = max_stresses_list[idx] if idx < len(max_stresses_list) else None
+                fmax_stress_gpa_val = (
+                    fmax_stress_val * 160.21766208
+                    if fmax_stress_val is not None
+                    else None
+                )
 
                 mace_s = runtime * mace_ratio
                 opt_s = runtime * opt_ratio
@@ -497,6 +540,9 @@ class Worker:
                     "converged": is_conv,
                     "failed_reason": failed_reason,
                     "fmax": fmax_val,
+                    "fmax_atom": fmax_atom_val,
+                    "fmax_stress": fmax_stress_val,
+                    "fmax_stress_gpa": fmax_stress_gpa_val,
                     "steps": steps,
                     "runtime": runtime,
                     "natoms": natoms,
@@ -520,9 +566,16 @@ class Worker:
                     json.dump(result_data, f, indent=2)
 
                 fail_msg = f" fail_reason={failed_reason}" if not is_conv else ""
+                atom_text = f"{fmax_atom_val:.4f}" if fmax_atom_val is not None else "n/a"
+                stress_text = (
+                    f"{fmax_stress_gpa_val:.3f}GPa"
+                    if fmax_stress_gpa_val is not None
+                    else "n/a"
+                )
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] DONE {stem}: "
-                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) fmax={fmax_val:.4f} t={runtime:.1f}s "
+                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) "
+                    f"fmax={fmax_val:.4f} (atom={atom_text}, stress={stress_text}) t={runtime:.1f}s "
                     f"[mace:{mace_s:.1f}s({mace_pct:.1f}%) opt:{opt_s:.1f}s({opt_pct:.1f}%) other:{other_s:.1f}s({other_pct:.1f}%)]"
                 )
 

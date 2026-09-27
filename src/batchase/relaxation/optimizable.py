@@ -565,6 +565,65 @@ class OptimizableBatch(Optimizable):
             )
             return result
 
+    def _format_observable(self, values: torch.Tensor) -> torch.Tensor | NDArray:
+        if self.numpy:
+            return values.detach().cpu().numpy()
+        return values
+
+    def get_max_atom_forces(
+        self,
+        forces: torch.Tensor | NDArray | None = None,
+        apply_constraint: bool = False,
+    ) -> torch.Tensor | NDArray:
+        """Get the maximum physical atomic force for each structure."""
+        if forces is None:
+            forces = self.get_property("forces", no_numpy=True)
+        elif isinstance(forces, np.ndarray):
+            forces = torch.as_tensor(forces, device=self.device, dtype=self.dtype)
+        else:
+            forces = forces.to(device=self.device, dtype=self.dtype)
+
+        forces = forces.reshape(-1, 3)
+        natoms = int(self.batch.num_nodes)
+        if forces.shape[0] < natoms:
+            raise ValueError(
+                f"Expected at least {natoms} force rows, got {forces.shape[0]}"
+            )
+        atom_forces = forces[:natoms]
+
+        if apply_constraint:
+            fixed = getattr(self.batch, "fixed", None)
+            if fixed is not None:
+                atom_forces = atom_forces.clone()
+                atom_forces[torch.where(fixed == 1)[0]] = 0.0
+
+        atom_norms = torch.linalg.vector_norm(atom_forces, dim=1)
+        result = torch.zeros(
+            len(self._slot_status), device=atom_norms.device, dtype=atom_norms.dtype
+        )
+        result.scatter_reduce_(
+            dim=0,
+            index=self.batch.batch,
+            src=atom_norms,
+            reduce="amax",
+            include_self=True,
+        )
+        return self._format_observable(result)
+
+    def _max_abs_stress(self, stress: torch.Tensor) -> torch.Tensor | NDArray:
+        stress = stress.reshape(stress.shape[0], -1)
+        return self._format_observable(stress.abs().amax(dim=1))
+
+    def get_max_stresses(self) -> torch.Tensor | NDArray | None:
+        """Get maximum model stress for fixed-cell calculations when available."""
+        if not self.compute_stress:
+            return None
+        try:
+            stress = self.get_property("stress", no_numpy=True).reshape(-1, 3, 3)
+        except PropertyNotImplementedError:
+            return None
+        return self._max_abs_stress(stress)
+
     def converged(
         self,
         forces: torch.Tensor | NDArray | None = None,
@@ -965,6 +1024,12 @@ class OptimizableUnitCellBatch(OptimizableBatch):
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()
 
+    def get_max_stresses(self) -> torch.Tensor | NDArray:
+        """Get maximum effective residual stress for each structure."""
+        if self.stress is None:
+            self.get_forces(no_numpy=True)
+        return self._max_abs_stress(self.stress.reshape(-1, 3, 3))
+
 
 class OptimizableFrechetCellBatch(OptimizableBatch):
     """Modify the supercell and the atom positions in relaxations using Fréchet derivatives.
@@ -1289,7 +1354,11 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
         
         augmented_forces[natoms:] = cell_forces_scaled
 
-        self.stress = -virial.view(-1, 9) / volumes.view(-1, 1)
+        effective_stress = -virial / volumes
+        if self.constant_volume:
+            diagonal = effective_stress.diagonal(dim1=-2, dim2=-1)
+            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
+        self.stress = effective_stress.view(-1, 9)
 
         if self.numpy and not no_numpy:
             augmented_forces = augmented_forces.cpu().numpy()
@@ -1322,3 +1391,9 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
     def get_potential_energies(self) -> torch.Tensor | NDArray:
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()
+
+    def get_max_stresses(self) -> torch.Tensor | NDArray:
+        """Get maximum effective residual stress for each structure."""
+        if self.stress is None:
+            self.get_forces(no_numpy=True)
+        return self._max_abs_stress(self.stress.reshape(-1, 3, 3))
