@@ -31,7 +31,7 @@ out = self.model(
 
 - `MACEBatchBackend.__init__` 新增 `compile_mode: Optional[str] = None` 参数。
 - `effective_compile_mode` 统一解析 `compile_mode` 与 `use_compile`。
-- 在 `calculator = mace_off(..., compile_mode=effective_compile_mode)` 处加入异常捕获机制：若在不支持 `torch.compile` 的环境或驱动下初始化失败，输出清晰警告日志并自动降级为未编译模型（`compile_mode=None`），避免直接崩溃。
+- 在 `calculator = mace_off(..., compile_mode=effective_compile_mode)` 处加入异常捕获机制：若 MACE 在初始化阶段因 `compile_mode` 失败，输出清晰警告日志并自动降级为未编译模型（`compile_mode=None`），避免直接崩溃。首次 forward 阶段的延迟编译错误不在本任务的自动回退范围内。
 
 ### 3. `Scheduler` 与 `Worker` 管道贯通
 

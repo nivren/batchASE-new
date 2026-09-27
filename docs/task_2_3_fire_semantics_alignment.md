@@ -7,11 +7,11 @@
 1. **FIRE 1.0 错误引入 `dtmin` 截断**：
    - ASE 原生 FIRE 1.0 在负功率重置时直接执行 `dt *= fdec`，没有 `dtmin` 下限限制；
    - batchASE 原实现强制套用了 FIRE2 的 `torch.maximum(..., dt_min_t)`（默认 `2e-3`），导致在振荡不稳定的结构中时间步无法充分衰减冻结。
-2. **`torch_scatter` 残留依赖与分支分歧**：
+2. **FIRE 路径中的 `torch_scatter` 残留依赖与分支分歧**：
    - `lbfgs.py` 已完全迁移至 PyTorch 原生 `scatter_add_` / `scatter_reduce`；
    - `fire.py` 中仍保留了 `try: from torch_scatter import scatter` 并在 CUDA 下调用外部扩展，引入不必要的第三方二进制扩展和舍入分歧。
 
-本任务目标：以最小范围修正上述两项问题，严格对齐 ASE 语义，并彻底清除 `torch_scatter` 残留。
+本任务目标：以最小范围修正上述两项问题，严格对齐 FIRE/FIRE2 的核心 ASE 语义，并移除 FIRE 模块中的 `torch_scatter` 依赖。其他优化器仍可保留兼容性的可选依赖。
 
 ## Core Design & Changes
 

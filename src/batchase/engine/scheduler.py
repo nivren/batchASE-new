@@ -7,7 +7,9 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
+from statistics import fmean, median
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -17,6 +19,63 @@ from .worker import Worker
 from ..utils import ensure_directory
 
 logger = logging.getLogger("batchase.engine.scheduler")
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _finite_float(value, positive: bool = False):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0.0):
+        return None
+    return number
+
+
+def _stage_attempted(record: dict, stage: str) -> bool:
+    status = record.get(f"{stage}_status")
+    status = str(status).strip().lower() if status is not None else ""
+    return bool(status) or _safe_int(record.get(f"{stage}_steps")) > 0
+
+
+def _summary_stats(values: list[float]):
+    if not values:
+        return None
+    return {
+        "count": len(values),
+        "min": min(values),
+        "median": median(values),
+        "mean": fmean(values),
+        "max": max(values),
+    }
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def _convergence_text(converged: int, attempted: int) -> str:
+    rate = (converged / attempted * 100.0) if attempted else 0.0
+    return f"{converged}/{attempted} ({rate:.1f}%)"
+
+
+def _format_worker_tail(stage_metrics: dict) -> str:
+    steps = _safe_int(stage_metrics.get("max_structure_steps"))
+    structure = str(stage_metrics.get("max_structure_file") or "-")
+    return f"{steps}/{structure}"
 
 
 def _worker_process_target(kwargs):
@@ -96,7 +155,16 @@ class Scheduler:
         self.use_fasteq = use_fasteq
         self.cueq = cueq
         mol_single_raw = molecule_single if molecule_single is not None else kwargs.pop("molecule_single", None)
-        self.molecule_single = int(mol_single_raw) if mol_single_raw is not None and int(mol_single_raw) > 0 else None
+        if mol_single_raw is None:
+            self.molecule_single = None
+        else:
+            try:
+                parsed_molecule_single = int(mol_single_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("molecule_single must be a positive integer or None") from exc
+            if parsed_molecule_single <= 0:
+                raise ValueError("molecule_single must be a positive integer or None")
+            self.molecule_single = parsed_molecule_single
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.pop("compile_mode", None)
 
@@ -259,10 +327,12 @@ class Scheduler:
             s1_time = float(s1_data.get("runtime", 0.0))
             s1_energy = float(s1_data.get("energy", 0.0))
             s1_density = float(s1_data.get("density", 0.0))
+            s1_fmax = s1_data.get("fmax")
             s2_steps = int(s2_data.get("steps", 0))
             s2_time = float(s2_data.get("runtime", 0.0))
             s2_energy = float(s2_data.get("energy", 0.0))
             s2_density = float(s2_data.get("density", 0.0))
+            s2_fmax = s2_data.get("fmax")
 
             s1_status = s1_data.get("status", "converged" if s1_data.get("converged") else "failed")
             s1_failed_reason = s1_data.get("failed_reason") or ""
@@ -300,6 +370,7 @@ class Scheduler:
                 "stage1_energy_kj_mol": s1_energy_kj_mol if s1_energy_kj_mol is not None else "",
                 "stage1_enthalpy_kj_mol": s1_enthalpy_kj_mol if s1_enthalpy_kj_mol is not None else "",
                 "stage1_density": s1_density,
+                "stage1_fmax": s1_fmax if s1_fmax is not None else "",
                 "stage2_status": s2_status,
                 "stage2_failed_reason": s2_failed_reason,
                 "stage2_steps": s2_steps,
@@ -308,6 +379,7 @@ class Scheduler:
                 "stage2_energy_kj_mol": s2_energy_kj_mol if s2_energy_kj_mol is not None else "",
                 "stage2_enthalpy_kj_mol": s2_enthalpy_kj_mol if s2_enthalpy_kj_mol is not None else "",
                 "stage2_density": s2_density,
+                "stage2_fmax": s2_fmax if s2_fmax is not None else "",
                 "total_steps": s1_steps + s2_steps,
                 "total_time": s1_time + s2_time,
             })
@@ -331,6 +403,7 @@ class Scheduler:
                         "stage1_energy_kj_mol",
                         "stage1_enthalpy_kj_mol",
                         "stage1_density",
+                        "stage1_fmax",
                         "stage2_status",
                         "stage2_failed_reason",
                         "stage2_steps",
@@ -339,6 +412,7 @@ class Scheduler:
                         "stage2_energy_kj_mol",
                         "stage2_enthalpy_kj_mol",
                         "stage2_density",
+                        "stage2_fmax",
                         "total_steps",
                         "total_time",
                     ],
@@ -347,6 +421,105 @@ class Scheduler:
                 writer.writerows(records)
             logger.info(f"Summary CSV generated: {csv_file}")
         self.summary_records = records
+
+    def _build_final_structure_summary(self, records: list[dict], has_stage2: bool) -> list[str]:
+        stage = "stage2" if has_stage2 else "stage1"
+        stage_label = "Stage 2 (Final)" if has_stage2 else "Stage 1 only"
+        attempted = [record for record in records if _stage_attempted(record, stage)]
+        converged = [
+            record
+            for record in attempted
+            if str(record.get(f"{stage}_status", "")).strip().lower() == "converged"
+        ]
+
+        density_values = []
+        fmax_values = []
+        for record in converged:
+            density = _finite_float(record.get(f"{stage}_density"), positive=True)
+            if density is not None:
+                density_values.append(density)
+            fmax = _finite_float(record.get(f"{stage}_fmax"))
+            if fmax is not None and fmax >= 0.0:
+                fmax_values.append(fmax)
+
+        pressure = _finite_float(self.scalar_pressure) or 0.0
+        if has_stage2 or abs(pressure) <= 0.0:
+            energy_key = f"{stage}_energy_kj_mol"
+            energy_label = "Energy"
+        else:
+            energy_key = f"{stage}_enthalpy_kj_mol"
+            energy_label = "Enthalpy"
+
+        energy_values = []
+        for record in converged:
+            normalization_status = str(record.get("normalization_status", "")).strip().lower()
+            if normalization_status in {"unnormalized", "invalid_atom_count"}:
+                continue
+            energy = _finite_float(record.get(energy_key))
+            if energy is not None:
+                energy_values.append(energy)
+
+        density_stats = _summary_stats(density_values)
+        fmax_stats = _summary_stats(fmax_values)
+        energy_stats = _summary_stats(energy_values)
+        stage1_attempted = [record for record in records if _stage_attempted(record, "stage1")]
+        stage1_converged = sum(
+            str(record.get("stage1_status", "")).strip().lower() == "converged"
+            for record in stage1_attempted
+        )
+        stage2_attempted = [record for record in records if _stage_attempted(record, "stage2")]
+        stage2_converged = sum(
+            str(record.get("stage2_status", "")).strip().lower() == "converged"
+            for record in stage2_attempted
+        )
+        lines = [
+            " Convergence Rates",
+            f"  S1                   : {_convergence_text(stage1_converged, len(stage1_attempted))}",
+        ]
+        if has_stage2:
+            lines.append(f"  S2                   : {_convergence_text(stage2_converged, len(stage2_attempted))}")
+        lines.extend([
+            f"  Final                : {_convergence_text(len(converged), len(attempted))}",
+            " Final Structure Summary",
+            f"  Final stage          : {stage_label}",
+            f"  Attempted / converged: {len(attempted)} / {len(converged)} (failed: {len(attempted) - len(converged)})",
+        ])
+
+        if fmax_stats is None:
+            lines.append("  Final fmax [eV/A]    : unavailable")
+        else:
+            target_fmax = self.fmax2 if has_stage2 else self.fmax1
+            lines.append(
+                f"  Final fmax [eV/A]    : n={fmax_stats['count']} "
+                f"median={fmax_stats['median']:.6f} p95={_percentile(fmax_values, 0.95):.6f} "
+                f"max={fmax_stats['max']:.6f} below_target={sum(value <= target_fmax for value in fmax_values)}/{len(fmax_values)} "
+                f"(target={target_fmax:.6f})"
+            )
+
+        if density_stats is None:
+            lines.append("  Density [g/cm^3]     : unavailable")
+        else:
+            lines.append(
+                f"  Density [g/cm^3]     : n={density_stats['count']} "
+                f"min={density_stats['min']:.4f} median={density_stats['median']:.4f} "
+                f"mean={density_stats['mean']:.4f} max={density_stats['max']:.4f}"
+            )
+
+        if energy_stats is None:
+            lines.append(f"  {energy_label} [kJ/mol per molecule] : unavailable (no normalized finite values)")
+        else:
+            minimum = energy_stats["min"]
+            deltas = [energy - minimum for energy in energy_values]
+            lines.append(
+                f"  {energy_label} [kJ/mol per molecule] : n={energy_stats['count']} "
+                f"min={energy_stats['min']:.4f} median={energy_stats['median']:.4f} "
+                f"mean={energy_stats['mean']:.4f} max={energy_stats['max']:.4f}"
+            )
+            lines.append(
+                f"  Relative {energy_label:<9}: median_delta={median(deltas):.4f} "
+                f"max_delta={max(deltas):.4f} within_5={sum(delta <= 5.0 for delta in deltas)}/{len(deltas)}"
+            )
+        return lines
 
     def _print_dashboard(self, elapsed: float) -> None:
         """Aggregate worker metrics and output performance summary dashboard."""
@@ -365,8 +538,6 @@ class Scheduler:
             return
 
         total_structures = len(self.files)
-
-        # Structure-level steps aggregated from results_scheduler.csv
         records = getattr(self, "summary_records", None)
         if not records:
             csv_file = os.path.join(self.output_path, "results_scheduler.csv")
@@ -379,35 +550,35 @@ class Scheduler:
             else:
                 records = []
 
-        s1_struct_steps = sum(int(r.get("stage1_steps", 0)) for r in records)
-        s2_struct_steps = sum(int(r.get("stage2_steps", 0)) for r in records)
-        tot_struct_steps = sum(int(r.get("total_steps", 0)) for r in records)
-        avg_s1_struct = s1_struct_steps / max(len(records), 1)
-        avg_s2_struct = s2_struct_steps / max(len(records), 1)
+        stage1_records = [record for record in records if _stage_attempted(record, "stage1")]
+        stage2_records = [record for record in records if _stage_attempted(record, "stage2")]
+        has_stage2 = bool(stage2_records)
+        if not records:
+            has_stage2 = any("final" in worker.get("stages", {}) for worker in worker_data)
 
-        # Stage 1 metrics
+        s1_struct_steps = sum(_safe_int(record.get("stage1_steps")) for record in stage1_records)
+        s2_struct_steps = sum(_safe_int(record.get("stage2_steps")) for record in stage2_records)
+        tot_struct_steps = s1_struct_steps + s2_struct_steps
+        avg_s1_struct = s1_struct_steps / max(len(stage1_records), 1)
+        avg_s2_struct = s2_struct_steps / max(len(stage2_records), 1)
+
         s1_mace = sum(w.get("stages", {}).get("press", {}).get("mace_s", 0.0) for w in worker_data)
         s1_opt = sum(w.get("stages", {}).get("press", {}).get("opt_s", 0.0) for w in worker_data)
         s1_graph = sum(w.get("stages", {}).get("press", {}).get("graph_s", 0.0) for w in worker_data)
         s1_io = sum(w.get("stages", {}).get("press", {}).get("io_s", 0.0) for w in worker_data)
-        s1_steps = sum(w.get("stages", {}).get("press", {}).get("steps", 0) for w in worker_data)
         s1_total_time = max(s1_mace + s1_opt + s1_graph + s1_io, 1e-6)
 
-        # Stage 2 metrics
         s2_mace = sum(w.get("stages", {}).get("final", {}).get("mace_s", 0.0) for w in worker_data)
         s2_opt = sum(w.get("stages", {}).get("final", {}).get("opt_s", 0.0) for w in worker_data)
         s2_graph = sum(w.get("stages", {}).get("final", {}).get("graph_s", 0.0) for w in worker_data)
         s2_io = sum(w.get("stages", {}).get("final", {}).get("io_s", 0.0) for w in worker_data)
-        s2_steps = sum(w.get("stages", {}).get("final", {}).get("steps", 0) for w in worker_data)
         s2_total_time = max(s2_mace + s2_opt + s2_graph + s2_io, 1e-6)
 
-        # Overall totals
         total_mace = s1_mace + s2_mace
         total_opt = s1_opt + s2_opt
         total_graph = s1_graph + s2_graph
         total_io = s1_io + s2_io
         total_worker_time = max(total_mace + total_opt + total_graph + total_io, 1e-6)
-        total_batch_steps = s1_steps + s2_steps
 
         mace_pct = (total_mace / total_worker_time) * 100.0
         opt_pct = (total_opt / total_worker_time) * 100.0
@@ -416,22 +587,20 @@ class Scheduler:
         s1_opt_pct = (s1_opt / total_worker_time) * 100.0
         s2_opt_pct = (s2_opt / total_worker_time) * 100.0
 
-        cluster_batch_rate = total_batch_steps / max(elapsed, 1e-6)
         cluster_struct_rate = tot_struct_steps / max(elapsed, 1e-6)
         structs_per_min = (total_structures / max(elapsed, 1e-6)) * 60.0
 
         model_name = self.model.upper() if hasattr(self, "model") and self.model else "MACE"
         c_mlip = f" MLIP ({model_name}) Inference"[:31].ljust(31)
-
-        opt_header = f"Optimizer ({self.optimizer1})" if self.optimizer1 == self.optimizer2 else f"Optimizer ({self.optimizer1}/{self.optimizer2})"
+        opt_header = (
+            f"Optimizer ({self.optimizer1})"
+            if self.optimizer1 == self.optimizer2
+            else f"Optimizer ({self.optimizer1}/{self.optimizer2})"
+        )
         c_opt = f" {opt_header}"[:31].ljust(31)
-
         filt1 = (" + Cell" if "Cell" in str(self.filter1) else f" + {self.filter1}") if self.filter1 else ""
-        filt2 = (" + Cell" if "Cell" in str(self.filter2) else f" + {self.filter2}") if self.filter2 else ""
         s1_tag = f"S1: {self.optimizer1}{filt1}"
-        s2_tag = f"S2: {self.optimizer2}{filt2}"
         c_s1 = f"   ├─ {s1_tag}"[:31].ljust(31)
-        c_s2 = f"   └─ {s2_tag}"[:31].ljust(31)
 
         lines = [
             "",
@@ -440,45 +609,76 @@ class Scheduler:
             "=" * 96,
             f" Total Wall Time   : {elapsed:.2f}s",
             f" Total Structures  : {total_structures}",
-            f" Structure Steps   : {tot_struct_steps:,} steps (S1: {s1_struct_steps:,} | S2: {s2_struct_steps:,}) [Avg: {avg_s1_struct:.1f} S1 / {avg_s2_struct:.1f} S2 per struct]",
-            f" Batch Iterations  : {total_batch_steps:,} GPU steps (S1: {s1_steps:,} | S2: {s2_steps:,})",
-            f" Cluster Throughput: {cluster_batch_rate:.1f} batch-steps/s ({cluster_struct_rate:.1f} struct-steps/s | {structs_per_min:.1f} structs/min)",
-            f" Active Devices    : {self.devices} ({self.num_workers} workers, batch_size={self.batch_size})",
-            "-" * 96,
-            " Component                     Stage 1 (Press)   Stage 2 (Final)   Total Worker Time    Share (%)",
-            "-" * 96,
-            f"{c_mlip}{s1_mace:>8.1f}s        {s2_mace:>8.1f}s          {total_mace:>8.1f}s        {mace_pct:>5.1f}%",
-            f"{c_opt}{s1_opt:>8.1f}s        {s2_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
-            f"{c_s1}{s1_opt:>8.1f}s               -            {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
-            f"{c_s2}      -          {s2_opt:>8.1f}s           {s2_opt:>8.1f}s        {s2_opt_pct:>5.1f}%",
-            f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s        {s2_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
-            f" Replenish & I/O               {s1_io:>8.1f}s        {s2_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
-            "-" * 96,
-            f" Total Active Worker Time      {s1_total_time:>8.1f}s        {s2_total_time:>8.1f}s          {total_worker_time:>8.1f}s       100.0%",
-            "-" * 96,
-            " Worker    Device     Structs   S1 Steps  S2 Steps  Tot Steps    S1 Time   S2 Time  Tot Time  Peak VRAM",
-            "-" * 96,
         ]
+        if has_stage2:
+            lines.extend([
+                f" Per-Structure Steps: {tot_struct_steps:,} steps (S1: {s1_struct_steps:,} | S2: {s2_struct_steps:,}) [Avg: {avg_s1_struct:.1f} S1 / {avg_s2_struct:.1f} S2 per attempted struct]",
+            ])
+        else:
+            lines.extend([
+                f" Per-Structure Steps: {s1_struct_steps:,} steps (S1: {s1_struct_steps:,}) [Avg: {avg_s1_struct:.1f} S1 per attempted struct]",
+            ])
+        lines.extend([
+            f" Cluster Throughput: {cluster_struct_rate:.1f} struct-steps/s ({structs_per_min:.1f} structs/min)",
+            f" Active Devices    : {self.devices} ({self.num_workers} workers, batch_size={self.batch_size})",
+        ])
+        lines.extend(self._build_final_structure_summary(records, has_stage2))
+        lines.extend(["-" * 96])
 
-        for w in sorted(worker_data, key=lambda x: x.get("worker_id", 0)):
-            wid = w.get("worker_id", 0)
-            dev = w.get("device", "unknown")
-            stages = w.get("stages", {})
-            s1 = stages.get("press", {})
-            s2 = stages.get("final", {})
-            structs = s1.get("structures", 0)
-            w_s1_steps = s1.get("steps", 0)
-            w_s2_steps = s2.get("steps", 0)
-            w_steps = w.get("total_steps", 0)
-            s1_t = s1.get("elapsed_s", 0.0)
-            s2_t = s2.get("elapsed_s", 0.0)
-            tot_t = w.get("total_elapsed_s", 0.0)
-            vram = w.get("peak_vram_gb", 0.0)
-            lines.append(
-                f" W{wid:02d}       {dev:<10s} {structs:>7d}  {w_s1_steps:>8d}  {w_s2_steps:>8d}  {w_steps:>9d}   {s1_t:>7.1f}s  {s2_t:>7.1f}s  {tot_t:>7.1f}s   {vram:>5.2f} GB"
-            )
+        if has_stage2:
+            lines.extend([
+                " Component                     Stage 1 (Press)   Stage 2 (Final)   Total Worker Time    Share (%)",
+                "-" * 96,
+                f"{c_mlip}{s1_mace:>8.1f}s        {s2_mace:>8.1f}s          {total_mace:>8.1f}s        {mace_pct:>5.1f}%",
+                f"{c_opt}{s1_opt:>8.1f}s        {s2_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
+                f"{c_s1}{s1_opt:>8.1f}s               -            {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
+                f"   └─ S2: {self.optimizer2}{(' + Cell' if 'Cell' in str(self.filter2) else f' + {self.filter2}') if self.filter2 else ''}"[:31].ljust(31) + f"      -          {s2_opt:>8.1f}s           {s2_opt:>8.1f}s        {s2_opt_pct:>5.1f}%",
+                f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s        {s2_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
+                f" Replenish & I/O               {s1_io:>8.1f}s        {s2_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
+                "-" * 96,
+                f" Total Active Worker Time      {s1_total_time:>8.1f}s        {s2_total_time:>8.1f}s          {total_worker_time:>8.1f}s       100.0%",
+                "-" * 96,
+                " Worker    Device     Structs   S1 Time   S2 Time  Tot Time  Peak VRAM  S1 Max (steps/id)       S2 Max (steps/id)",
+                "-" * 96,
+            ])
+        else:
+            lines.extend([
+                " Component                     Stage 1 (Press)   Total Worker Time    Share (%)",
+                "-" * 96,
+                f"{c_mlip}{s1_mace:>8.1f}s          {total_mace:>8.1f}s        {mace_pct:>5.1f}%",
+                f"{c_opt}{s1_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
+                f"{c_s1}{s1_opt:>8.1f}s          {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
+                f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
+                f" Replenish & I/O               {s1_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
+                "-" * 96,
+                f" Total Active Worker Time      {s1_total_time:>8.1f}s          {total_worker_time:>8.1f}s       100.0%",
+                "-" * 96,
+                " Worker    Device     Structs   S1 Time  Tot Time  Peak VRAM  S1 Max (steps/id)",
+                "-" * 96,
+            ])
+
+        for worker in sorted(worker_data, key=lambda item: item.get("worker_id", 0)):
+            worker_id = worker.get("worker_id", 0)
+            device = worker.get("device", "unknown")
+            stages = worker.get("stages", {})
+            stage1 = stages.get("press", {})
+            stage2 = stages.get("final", {})
+            structures = stage1.get("structures", 0)
+            stage1_time = stage1.get("elapsed_s", 0.0)
+            stage2_time = stage2.get("elapsed_s", 0.0)
+            total_time = worker.get("total_elapsed_s", 0.0)
+            vram = worker.get("peak_vram_gb", 0.0)
+            stage1_tail = _format_worker_tail(stage1)
+            stage2_tail = _format_worker_tail(stage2)
+            if has_stage2:
+                lines.append(
+                    f" W{worker_id:02d}       {device:<10s} {structures:>7d}  {stage1_time:>7.1f}s  {stage2_time:>7.1f}s  {total_time:>7.1f}s   {vram:>5.2f} GB  {stage1_tail:<25s} {stage2_tail:<25s}"
+                )
+            else:
+                lines.append(
+                    f" W{worker_id:02d}       {device:<10s} {structures:>7d}  {stage1_time:>7.1f}s  {total_time:>7.1f}s   {vram:>5.2f} GB  {stage1_tail}"
+                )
 
         lines.append("=" * 96)
         lines.append("")
-
         logger.info("\n".join(lines))

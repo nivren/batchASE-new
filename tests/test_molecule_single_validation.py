@@ -15,10 +15,32 @@ import os
 import tempfile
 import unittest
 
+import torch
 from ase import Atoms
+from ase.io import write
 
 from batchase.engine.scheduler import Scheduler
 from batchase.engine.worker import Worker
+from batchase.neighbors import AtomsToGraphs
+
+
+class ZeroBackend:
+    kind = "mock"
+    device = torch.device("cpu")
+    dtype = torch.float64
+    mace_time = 0.0
+    graph_time = 0.0
+
+    def predict(self, batch, compute_stress: bool = False):
+        result = {
+            "energy": torch.zeros(batch.num_graphs, dtype=torch.float64),
+            "forces": torch.zeros(batch.pos.shape, dtype=torch.float64),
+        }
+        if compute_stress:
+            result["stress"] = torch.zeros(
+                (batch.num_graphs, 3, 3), dtype=torch.float64
+            )
+        return result
 
 
 class TestMoleculeSingleValidation(unittest.TestCase):
@@ -36,6 +58,55 @@ class TestMoleculeSingleValidation(unittest.TestCase):
 
         scheduler = Scheduler(files=["dummy.cif"], devices=["cpu"])
         self.assertIsNone(scheduler.molecule_single)
+
+    def test_nonpositive_molecule_single_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Worker(files=["dummy.cif"], device="cpu", molecule_single=0)
+        with self.assertRaises(ValueError):
+            Scheduler(files=["dummy.cif"], devices=["cpu"], molecule_single=-1)
+
+    def test_invalid_atom_count_writes_result_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cif_path = os.path.join(tmpdir, "two_atoms.cif")
+            write(
+                cif_path,
+                Atoms(
+                    "H2",
+                    positions=[[0.0, 0.0, 0.0], [0.7, 0.0, 0.0]],
+                    cell=[5.0, 5.0, 5.0],
+                    pbc=True,
+                ),
+            )
+            output_dir = os.path.join(tmpdir, "output")
+            worker = Worker(
+                files=[cif_path],
+                device="cpu",
+                batch_size=1,
+                max_steps=1,
+                molecule_single=3,
+                output_path=output_dir,
+            )
+            worker._run_stage(
+                files=[cif_path],
+                stage_name="press",
+                filter_type=None,
+                optimizer_name="FIRE",
+                scalar_pressure=0.0,
+                backend=ZeroBackend(),
+                a2g=AtomsToGraphs(
+                    r_edges=False, r_pbc=True, dtype=torch.float64
+                ),
+                fmax=0.01,
+            )
+
+            result_path = os.path.join(
+                output_dir, "json_result_press", "two_atoms.json"
+            )
+            with open(result_path, encoding="utf-8") as f:
+                result = json.load(f)
+            self.assertEqual(result["normalization_status"], "invalid_atom_count")
+            self.assertIsNone(result["num_molecules"])
+            self.assertIsNone(result["energy_per_mol"])
 
     def test_normalization_exact_multiple(self):
         """natoms % molecule_single == 0 produces integer num_molecules and normalized status."""

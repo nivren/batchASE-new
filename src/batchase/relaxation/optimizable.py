@@ -477,14 +477,16 @@ class OptimizableBatch(Optimizable):
         """Get internal potential energy E for each system in batch (excluding PV term)."""
         return self.get_potential_energies()
 
-    def get_pv_terms(self) -> torch.Tensor:
+    def get_pv_terms(self) -> torch.Tensor | NDArray:
         """Get PV work term for each system in batch (zeros for fixed cell)."""
         energies = self.get_potential_energies()
-        if hasattr(energies, "device"):
+        if isinstance(energies, torch.Tensor):
             return torch.zeros_like(energies)
-        return torch.zeros(len(energies), dtype=torch.float64)
+        if isinstance(energies, np.ndarray):
+            return np.zeros_like(energies)
+        return 0.0
 
-    def get_enthalpies(self) -> torch.Tensor:
+    def get_enthalpies(self) -> torch.Tensor | NDArray:
         """Get enthalpy H = E + PV for each system in batch."""
         return self.get_internal_energies() + self.get_pv_terms()
 
@@ -942,19 +944,24 @@ class OptimizableUnitCellBatch(OptimizableBatch):
     def get_internal_energies(self) -> torch.Tensor:
         """Get internal potential energy E for each system in batch (excluding PV term)."""
         energies = self.get_property("energy")
-        if hasattr(energies, "view"):
-            return energies.view(-1)
+        if isinstance(energies, torch.Tensor):
+            return energies.reshape(-1)
+        if isinstance(energies, np.ndarray):
+            return energies.reshape(-1)
         return energies
 
-    def get_pv_terms(self) -> torch.Tensor:
+    def get_pv_terms(self) -> torch.Tensor | NDArray:
         """Get PV work term for each system in batch."""
-        return self.pressure[0, 0] * self.get_volumes()
+        pv_terms = self.pressure[0, 0] * self.get_volumes()
+        if self.numpy:
+            return pv_terms.detach().cpu().numpy()
+        return pv_terms
 
-    def get_enthalpies(self) -> torch.Tensor:
+    def get_enthalpies(self) -> torch.Tensor | NDArray:
         """Get enthalpy H = E + PV for each system in batch."""
         return self.get_internal_energies() + self.get_pv_terms()
 
-    def get_potential_energies(self) -> torch.Tensor:
+    def get_potential_energies(self) -> torch.Tensor | NDArray:
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()
 
@@ -1295,18 +1302,23 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
     def get_internal_energies(self) -> torch.Tensor:
         """Get internal potential energy E for each system in batch (excluding PV term)."""
         energies = self.get_property("energy")
-        if hasattr(energies, "view"):
-            return energies.view(-1)
+        if isinstance(energies, torch.Tensor):
+            return energies.reshape(-1)
+        if isinstance(energies, np.ndarray):
+            return energies.reshape(-1)
         return energies
 
-    def get_pv_terms(self) -> torch.Tensor:
+    def get_pv_terms(self) -> torch.Tensor | NDArray:
         """Get PV work term for each system in batch."""
-        return self.pressure[0, 0] * self.get_volumes()
+        pv_terms = self.pressure[0, 0] * self.get_volumes()
+        if self.numpy:
+            return pv_terms.detach().cpu().numpy()
+        return pv_terms
 
-    def get_enthalpies(self) -> torch.Tensor:
+    def get_enthalpies(self) -> torch.Tensor | NDArray:
         """Get enthalpy H = E + PV for each system in batch."""
         return self.get_internal_energies() + self.get_pv_terms()
 
-    def get_potential_energies(self) -> torch.Tensor:
+    def get_potential_energies(self) -> torch.Tensor | NDArray:
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()

@@ -81,7 +81,16 @@ class Worker:
         self.skip_second_stage = skip_second_stage
         self.scalar_pressure = scalar_pressure
         mol_single_raw = molecule_single if molecule_single is not None else kwargs.get("molecule_single", None)
-        self.molecule_single = int(mol_single_raw) if mol_single_raw is not None and int(mol_single_raw) > 0 else None
+        if mol_single_raw is None:
+            self.molecule_single = None
+        else:
+            try:
+                parsed_molecule_single = int(mol_single_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("molecule_single must be a positive integer or None") from exc
+            if parsed_molecule_single <= 0:
+                raise ValueError("molecule_single must be a positive integer or None")
+            self.molecule_single = parsed_molecule_single
         self.output_path = os.path.abspath(output_path)
         self.model = model
         self.use_fasteq = use_fasteq
@@ -135,12 +144,18 @@ class Worker:
         empty_metrics: Dict[str, Any] = {
             "structures": 0,
             "steps": 0,
+            "batch_iterations": 0,
             "elapsed_s": 0.0,
             "mace_s": 0.0,
             "opt_s": 0.0,
             "graph_s": 0.0,
             "io_s": 0.0,
             "peak_vram_gb": 0.0,
+            "max_structure_steps": 0,
+            "max_structure_file": "",
+            "max_structure_status": "",
+            "max_structure_failed_reason": "",
+            "max_structure_fmax": None,
         }
         if not files:
             return [], empty_metrics
@@ -208,6 +223,11 @@ class Worker:
         stage_graph_start = backend.graph_time
         output_cif_paths = []
         stage_success_cifs = []
+        max_structure_steps = 0
+        max_structure_file = ""
+        max_structure_status = ""
+        max_structure_failed_reason = ""
+        max_structure_fmax = None
 
         while converged_atoms_count < len(files):
             # Dynamic batch replenishment when structures finish
@@ -399,6 +419,13 @@ class Worker:
                 other_pct = other_ratio * 100.0
 
                 natoms = len(optimized_atoms[idx])
+                stem = Path(cur_batch_path[idx]).stem
+                if steps > max_structure_steps:
+                    max_structure_steps = steps
+                    max_structure_file = stem
+                    max_structure_status = status
+                    max_structure_failed_reason = failed_reason or ""
+                    max_structure_fmax = fmax_val
                 num_mol = None
                 energy_per_mol = None
                 normalization_status = "unnormalized"
@@ -447,7 +474,6 @@ class Worker:
 
                 density = self._get_density(optimized_atoms[idx])
 
-                stem = Path(cur_batch_path[idx]).stem
                 out_cif = os.path.join(cif_dir, f"{stem}.cif")
                 out_json = os.path.join(json_dir, f"{stem}.json")
 
@@ -477,7 +503,8 @@ class Worker:
                     "molecule_single": self.molecule_single,
                     "num_molecules": num_mol,
                     "normalization_status": normalization_status,
-                    "energy_raw_ev": e_int_val,
+                    "energy_raw_ev": e_val,
+                    "internal_energy_raw_ev": e_int_val,
                     "enthalpy_raw_ev": h_val,
                     "pv_raw_ev": pv_val,
                     "energy_kj_mol": energy_kj_mol,
@@ -503,10 +530,8 @@ class Worker:
 
             now = time.perf_counter()
             if (converged_atoms_count > 0 and converged_atoms_count % 20 == 0) or (now - last_heartbeat >= 30.0):
-                stage_elapsed = max(now - stage_start, 1e-6)
                 surviving_count = len(cur_batch_path) - len(all_indices)
                 active_slots = surviving_count if converged_atoms_count < len(files) else 0
-                worker_rate = total_steps_in_stage / stage_elapsed
                 vram_gb = (
                     torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
                     if str(self.device).startswith("cuda")
@@ -515,7 +540,7 @@ class Worker:
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] progress: {converged_atoms_count}/{len(files)} done | "
                     f"active_slots: {active_slots}/{self.batch_size} | "
-                    f"avg_rate: {worker_rate:.1f} st/s | peak_vram: {vram_gb:.2f} GB"
+                    f"peak_vram: {vram_gb:.2f} GB"
                 )
                 last_heartbeat = now
 
@@ -524,7 +549,6 @@ class Worker:
         final_graph_time = max(0.0, backend.graph_time - stage_graph_start)
         final_opt_time = max(0.0, total_burst_time - (final_mace_time + final_graph_time))
         final_io_time = max(0.0, stage_total_time - total_burst_time)
-        stage_rate = total_steps_in_stage / stage_total_time
         vram_gb = (
             torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
             if str(self.device).startswith("cuda")
@@ -532,19 +556,25 @@ class Worker:
         )
         logger.info(
             f"{self.worker_tag} [{stage_name}] completed: {len(files)} structures in {stage_total_time:.2f}s "
-            f"({len(stage_success_cifs)} qualified for next stage, {total_steps_in_stage} steps, {stage_rate:.1f} st/s, peak_vram: {vram_gb:.2f} GB)"
+            f"({len(stage_success_cifs)} qualified for next stage, peak_vram: {vram_gb:.2f} GB)"
         )
         stage_metrics = {
             "structures": len(files),
             "converged": len(stage_success_cifs),
             "output_cifs": len(output_cif_paths),
             "steps": total_steps_in_stage,
+            "batch_iterations": total_steps_in_stage,
             "elapsed_s": stage_total_time,
             "mace_s": final_mace_time,
             "opt_s": final_opt_time,
             "graph_s": final_graph_time,
             "io_s": final_io_time,
             "peak_vram_gb": vram_gb,
+            "max_structure_steps": max_structure_steps,
+            "max_structure_file": max_structure_file,
+            "max_structure_status": max_structure_status,
+            "max_structure_failed_reason": max_structure_failed_reason,
+            "max_structure_fmax": max_structure_fmax,
         }
         return stage_success_cifs, stage_metrics
 
@@ -597,7 +627,9 @@ class Worker:
             else 0.0
         )
 
-        total_steps = sum(m.get("steps", 0) for m in stages_dict.values())
+        total_batch_iterations = sum(
+            m.get("batch_iterations", m.get("steps", 0)) for m in stages_dict.values()
+        )
         total_mace = sum(m.get("mace_s", 0.0) for m in stages_dict.values())
         total_opt = sum(m.get("opt_s", 0.0) for m in stages_dict.values())
         total_graph = sum(m.get("graph_s", 0.0) for m in stages_dict.values())
@@ -608,7 +640,8 @@ class Worker:
             "device": str(self.device),
             "stages": stages_dict,
             "total_elapsed_s": total_elapsed,
-            "total_steps": total_steps,
+            "total_steps": total_batch_iterations,
+            "total_batch_iterations": total_batch_iterations,
             "mace_s": total_mace,
             "opt_s": total_opt,
             "graph_s": total_graph,

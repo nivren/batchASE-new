@@ -63,7 +63,7 @@ else:
 
 ### 3. JSON 与 CSV 增强字段输出
 
-- **JSON 输出**：增补 `"natoms"`, `"molecule_single"`, `"num_molecules"`, `"normalization_status"`, `"energy_raw_ev"`, `"energy_per_mol"` 等字段。
+- **JSON 输出**：增补 `"natoms"`, `"molecule_single"`, `"num_molecules"`, `"normalization_status"`, `"energy_raw_ev"`, `"energy_per_mol"` 等字段。非法的显式 `molecule_single`（非正整数）直接拒绝，避免静默退化为未归一化。
 - **CSV 输出**（`results_scheduler.csv`）：新增 `"natoms"`, `"num_molecules"`, `"normalization_status"` 列。
 
 ## Tests & Verification
@@ -73,14 +73,16 @@ else:
 | 测试方法 | 覆盖点 |
 |---|---|
 | `test_worker_init_defaults_to_none` | 验证 Worker 与 Scheduler 默认 `molecule_single` 为 `None` |
+| `test_nonpositive_molecule_single_is_rejected` | 验证显式传入非正数时立即拒绝 |
 | `test_normalization_exact_multiple` | 验证当 `natoms % molecule_single == 0` 时，得到正确整数分子数与 `"normalized"` 状态 |
 | `test_normalization_not_divisible` | 验证非整除时标记 `"invalid_atom_count"`，跳过每分子能量归一化并保持 `energy_per_mol is None` |
 | `test_normalization_when_none` | 验证未传参数时标记 `"unnormalized"` 状态 |
+| `test_invalid_atom_count_writes_result_without_crashing` | 验证非整除结构仍能写出结果 JSON，而不是触发局部变量异常 |
 | `test_csv_summary_includes_molecule_fields` | 验证生成的 `results_scheduler.csv` 包含 `natoms`、`num_molecules` 和 `normalization_status` 列 |
 
 ### 回归与代码质量
 
-- 专项测试：5/5 通过
+- 专项测试：7/7 通过
 - 历史测试：39/39 通过
-- 全套测试：**44/44 通过**
+- 全套测试：**46/46 通过**
 - `git diff --check`：通过
