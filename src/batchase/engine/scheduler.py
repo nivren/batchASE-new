@@ -285,6 +285,14 @@ class Scheduler:
             s2_energy_kj_mol = s2_data.get("energy_kj_mol")
             s2_enthalpy_kj_mol = s2_data.get("enthalpy_kj_mol")
 
+            s1_fmax = s1_data.get("fmax")
+            s1_fmax_atom = s1_data.get("fmax_atom", s1_fmax)
+            s1_fmax_stress = s1_data.get("fmax_stress")
+
+            s2_fmax = s2_data.get("fmax") if s2_data else None
+            s2_fmax_atom = s2_data.get("fmax_atom", s2_fmax) if s2_data else None
+            s2_fmax_stress = s2_data.get("fmax_stress") if s2_data else None
+
             records.append({
                 "file": stem,
                 "status": final_status,
@@ -296,6 +304,9 @@ class Scheduler:
                 "stage1_failed_reason": s1_failed_reason,
                 "stage1_steps": s1_steps,
                 "stage1_time": s1_time,
+                "stage1_fmax": s1_fmax if s1_fmax is not None else "",
+                "stage1_fmax_atom": s1_fmax_atom if s1_fmax_atom is not None else "",
+                "stage1_fmax_stress": s1_fmax_stress if s1_fmax_stress is not None else "",
                 "stage1_energy": s1_energy,
                 "stage1_energy_kj_mol": s1_energy_kj_mol if s1_energy_kj_mol is not None else "",
                 "stage1_enthalpy_kj_mol": s1_enthalpy_kj_mol if s1_enthalpy_kj_mol is not None else "",
@@ -304,6 +315,9 @@ class Scheduler:
                 "stage2_failed_reason": s2_failed_reason,
                 "stage2_steps": s2_steps,
                 "stage2_time": s2_time,
+                "stage2_fmax": s2_fmax if s2_fmax is not None else "",
+                "stage2_fmax_atom": s2_fmax_atom if s2_fmax_atom is not None else "",
+                "stage2_fmax_stress": s2_fmax_stress if s2_fmax_stress is not None else "",
                 "stage2_energy": s2_energy,
                 "stage2_energy_kj_mol": s2_energy_kj_mol if s2_energy_kj_mol is not None else "",
                 "stage2_enthalpy_kj_mol": s2_enthalpy_kj_mol if s2_enthalpy_kj_mol is not None else "",
@@ -327,6 +341,9 @@ class Scheduler:
                         "stage1_failed_reason",
                         "stage1_steps",
                         "stage1_time",
+                        "stage1_fmax",
+                        "stage1_fmax_atom",
+                        "stage1_fmax_stress",
                         "stage1_energy",
                         "stage1_energy_kj_mol",
                         "stage1_enthalpy_kj_mol",
@@ -335,6 +352,9 @@ class Scheduler:
                         "stage2_failed_reason",
                         "stage2_steps",
                         "stage2_time",
+                        "stage2_fmax",
+                        "stage2_fmax_atom",
+                        "stage2_fmax_stress",
                         "stage2_energy",
                         "stage2_energy_kj_mol",
                         "stage2_enthalpy_kj_mol",

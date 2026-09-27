@@ -563,6 +563,55 @@ class OptimizableBatch(Optimizable):
             )
             return result
 
+    def get_max_atom_forces(
+        self, forces: torch.Tensor | None = None, apply_constraint: bool = False
+    ) -> torch.Tensor:
+        """Get the maximum atomic force magnitude for each structure in the batch (in eV/Å).
+
+        Evaluates purely the physical forces on atoms, excluding any virtual/cell DOFs.
+        """
+        if forces is None:
+            forces = self.get_property("forces", no_numpy=True)
+            if (
+                apply_constraint
+                and hasattr(self.batch, "fixed")
+                and self.batch.fixed is not None
+            ):
+                forces = forces.clone()
+                fixed_idx = torch.where(self.batch.fixed == 1)[0]
+                forces[fixed_idx] = 0.0
+
+        forces = forces.view(-1, 3)
+        natoms = getattr(self.batch, "num_nodes", None)
+        if natoms is not None and forces.shape[0] >= natoms:
+            forces = forces[:natoms]
+
+        atom_f_norm = (forces.pow(2).sum(dim=1)).sqrt()
+        batch_size = len(self._slot_status)
+        result = torch.zeros(batch_size, device=forces.device, dtype=forces.dtype)
+        return result.scatter_reduce(
+            dim=0,
+            index=self.batch.batch,
+            src=atom_f_norm,
+            reduce="amax",
+            include_self=True,
+        )
+
+    def get_max_stresses(self) -> torch.Tensor:
+        """Get the maximum residual stress component for each structure in the batch (in eV/Å^3).
+
+        For fixed-cell optimization (OptimizableBatch), cell degrees of freedom are not optimized,
+        so residual stress is zero (or if stress was explicitly computed, returns the max absolute stress).
+        """
+        n_slots = len(self._slot_status)
+        if self.compute_stress and "stress" in self.torch_results:
+            try:
+                stress = self.get_property("stress", no_numpy=True).view(-1, 3, 3)
+                return stress.abs().view(stress.shape[0], -1).amax(dim=-1)
+            except Exception:
+                pass
+        return torch.zeros(n_slots, device=self.device, dtype=self.dtype)
+
     def converged(
         self,
         forces: torch.Tensor | NDArray | None = None,
@@ -958,6 +1007,34 @@ class OptimizableUnitCellBatch(OptimizableBatch):
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()
 
+    def get_max_stresses(self) -> torch.Tensor:
+        """Get the maximum residual Cauchy stress component for each structure in the batch (in eV/Å^3).
+
+        Residual stress takes into account external hydrostatic pressure:
+            sigma_res = sigma + P * I
+        and projects out any constrained or fixed strain components.
+        """
+        stress = self.get_property("stress", no_numpy=True).view(-1, 3, 3)
+        res_stress = (
+            stress
+            + self.pressure.to(device=stress.device, dtype=stress.dtype).view(-1, 3, 3)
+        ).clone()
+        if self.hydrostatic_strain:
+            tr = res_stress.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True) / 3.0
+            res_stress = (
+                torch.eye(3, device=res_stress.device, dtype=res_stress.dtype).unsqueeze(0)
+                * tr.unsqueeze(-1)
+            )
+        if (self.mask != 1.0).any():
+            res_stress = res_stress * self.mask.to(
+                device=res_stress.device, dtype=res_stress.dtype
+            ).view(-1, 3, 3)
+        if self.constant_volume:
+            diagonal = res_stress.diagonal(dim1=-2, dim2=-1)
+            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
+
+        return res_stress.abs().view(res_stress.shape[0], -1).amax(dim=-1)
+
 
 class OptimizableFrechetCellBatch(OptimizableBatch):
     """Modify the supercell and the atom positions in relaxations using Fréchet derivatives.
@@ -1310,3 +1387,31 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
     def get_potential_energies(self) -> torch.Tensor:
         """Get the optimization objective (enthalpy when pressure != 0)."""
         return self.get_enthalpies()
+
+    def get_max_stresses(self) -> torch.Tensor:
+        """Get the maximum residual Cauchy stress component for each structure in the batch (in eV/Å^3).
+
+        Residual stress takes into account external hydrostatic pressure:
+            sigma_res = sigma + P * I
+        and projects out any constrained or fixed strain components.
+        """
+        stress = self.get_property("stress", no_numpy=True).view(-1, 3, 3)
+        res_stress = (
+            stress
+            + self.pressure.to(device=stress.device, dtype=stress.dtype).view(-1, 3, 3)
+        ).clone()
+        if self.hydrostatic_strain:
+            tr = res_stress.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True) / 3.0
+            res_stress = (
+                torch.eye(3, device=res_stress.device, dtype=res_stress.dtype).unsqueeze(0)
+                * tr.unsqueeze(-1)
+            )
+        if (self.mask != 1.0).any():
+            res_stress = res_stress * self.mask.to(
+                device=res_stress.device, dtype=res_stress.dtype
+            ).view(-1, 3, 3)
+        if self.constant_volume:
+            diagonal = res_stress.diagonal(dim1=-2, dim2=-1)
+            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
+
+        return res_stress.abs().view(res_stress.shape[0], -1).amax(dim=-1)

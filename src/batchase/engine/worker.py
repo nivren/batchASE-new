@@ -361,6 +361,30 @@ class Worker:
             except Exception:
                 max_forces_list = [0.0] * len(cur_batch_path)
 
+            try:
+                if hasattr(obatch, "get_max_atom_forces"):
+                    max_atom_forces_tensor = obatch.get_max_atom_forces()
+                    if hasattr(max_atom_forces_tensor, "tolist"):
+                        max_atom_forces_list = max_atom_forces_tensor.detach().cpu().tolist()
+                    else:
+                        max_atom_forces_list = [float(f) for f in max_atom_forces_tensor]
+                else:
+                    max_atom_forces_list = max_forces_list
+            except Exception:
+                max_atom_forces_list = max_forces_list
+
+            try:
+                if hasattr(obatch, "get_max_stresses"):
+                    max_stresses_tensor = obatch.get_max_stresses()
+                    if hasattr(max_stresses_tensor, "tolist"):
+                        max_stresses_list = max_stresses_tensor.detach().cpu().tolist()
+                    else:
+                        max_stresses_list = [float(s) for s in max_stresses_tensor]
+                else:
+                    max_stresses_list = [0.0] * len(cur_batch_path)
+            except Exception:
+                max_stresses_list = [0.0] * len(cur_batch_path)
+
             cur_elapsed = max(time.perf_counter() - stage_start, 1e-6)
             cur_mace_time = max(0.0, backend.mace_time - stage_mace_start)
             cur_graph_time = max(0.0, backend.graph_time - stage_graph_start)
@@ -390,6 +414,9 @@ class Worker:
 
                 conv_str = "YES" if is_conv else "NO"
                 fmax_val = max_forces_list[idx] if idx < len(max_forces_list) else 0.0
+                fmax_atom_val = max_atom_forces_list[idx] if idx < len(max_atom_forces_list) else 0.0
+                fmax_stress_val = max_stresses_list[idx] if idx < len(max_stresses_list) else 0.0
+                fmax_stress_gpa_val = fmax_stress_val * 160.21766208
 
                 mace_s = runtime * mace_ratio
                 opt_s = runtime * opt_ratio
@@ -471,6 +498,9 @@ class Worker:
                     "converged": is_conv,
                     "failed_reason": failed_reason,
                     "fmax": fmax_val,
+                    "fmax_atom": fmax_atom_val,
+                    "fmax_stress": fmax_stress_val,
+                    "fmax_stress_gpa": fmax_stress_gpa_val,
                     "steps": steps,
                     "runtime": runtime,
                     "natoms": natoms,
@@ -495,7 +525,8 @@ class Worker:
                 fail_msg = f" fail_reason={failed_reason}" if not is_conv else ""
                 logger.info(
                     f"{self.worker_tag} [{stage_name}] DONE {stem}: "
-                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) fmax={fmax_val:.4f} t={runtime:.1f}s "
+                    f"status={status} conv={conv_str}{fail_msg} steps={steps} ({rate:.1f} st/s) "
+                    f"fmax={fmax_val:.4f} (atom={fmax_atom_val:.4f}, stress={fmax_stress_gpa_val:.3f}GPa) t={runtime:.1f}s "
                     f"[mace:{mace_s:.1f}s({mace_pct:.1f}%) opt:{opt_s:.1f}s({opt_pct:.1f}%) other:{other_s:.1f}s({other_pct:.1f}%)]"
                 )
 
