@@ -1,5 +1,7 @@
 from __future__ import annotations
+from contextlib import contextmanager, nullcontext
 import logging
+from time import perf_counter
 import torch
 # from .linesearch_torch import LineSearchBatch
 from ..optimizable import OptimizableBatch
@@ -14,6 +16,14 @@ class BFGSFusedLS:
     Port of BFGSLineSearch from bfgslinesearch.py, adapted to PyTorch
     and batched operations, mirroring lbfgs_torch.py structure.
     """
+    _PROFILER_SECTIONS = (
+        "hessian_update",
+        "direction_calc",
+        "host_device_transfer",
+        "linesearch_state",
+        "position_filter_update",
+    )
+
     def __init__(
         self,
         optimizable_batch: OptimizableBatch,
@@ -43,8 +53,19 @@ class BFGSFusedLS:
         self.f_upper_limit = f_upper_limit
         self.use_profiler = use_profiler
         self.profiler_log_dir = profiler_log_dir
-        self.profiler_schedule_config = profiler_schedule_config or {"wait": 48, "warmup": 1, "active": 1, "repeat": 8}
+        self.profiler_schedule_config = profiler_schedule_config or {
+            "wait": 0,
+            "warmup": 0,
+            "active": 1,
+            "repeat": 1,
+        }
         self.dtype = dtype
+        self._profiler_cuda = bool(
+            self.use_profiler
+            and torch.device(self.device).type == "cuda"
+            and torch.cuda.is_available()
+        )
+        self.reset_profiler_timings()
 
         self.converge_indices_list = None
         self.failed_indices_list = None
@@ -61,6 +82,49 @@ class BFGSFusedLS:
         ## need to be recalculate when early stop is triggered
         self.forces = None
         self.energies = None
+
+    def reset_profiler_timings(self) -> None:
+        """Reset optional timing accumulators without changing optimizer state."""
+        self.profiler_timings = {f"{name}_s": 0.0 for name in self._PROFILER_SECTIONS}
+        self.profiler_calls = {name: 0 for name in self._PROFILER_SECTIONS}
+
+    def get_profiler_breakdown(self) -> dict:
+        """Return JSON-serializable timing totals for the measured optimizer sections."""
+        total_s = sum(self.profiler_timings.values())
+        breakdown = {
+            "enabled": bool(self.use_profiler),
+            "measured_total_s": total_s,
+            "measured_total_ms": total_s * 1000.0,
+            "calls": dict(self.profiler_calls),
+        }
+        for name in self._PROFILER_SECTIONS:
+            seconds = self.profiler_timings[f"{name}_s"]
+            breakdown[f"{name}_s"] = seconds
+            breakdown[f"{name}_ms"] = seconds * 1000.0
+            breakdown[f"{name}_pct"] = 100.0 * seconds / total_s if total_s > 0.0 else 0.0
+        return breakdown
+
+    @contextmanager
+    def _time_section(self, name: str):
+        """Measure one opt-in section and expose it to torch.profiler."""
+        if not self.use_profiler:
+            yield
+            return
+
+        if self._profiler_cuda:
+            torch.cuda.synchronize(self.device)
+        start = perf_counter()
+        try:
+            with record_function(f"bfgs::{name}"):
+                try:
+                    yield
+                finally:
+                    if self._profiler_cuda:
+                        torch.cuda.synchronize(self.device)
+        finally:
+            elapsed = perf_counter() - start
+            self.profiler_timings[f"{name}_s"] += elapsed
+            self.profiler_calls[name] += 1
     
     def restart_from_earlystop(self, restart_indices, old_batch_indices):
         Hs_new = []
@@ -107,44 +171,53 @@ class BFGSFusedLS:
         g = -self.forces.reshape(-1) / self.alpha
         idx_t = optimizable.batch_indices.repeat_interleave(3)
         p0_list = self.p_list
-        self.update(r, g, self.r0, self.g0, p0_list)
+        with self._time_section("hessian_update"):
+            self.update(r, g, self.r0, self.g0, p0_list)
         if self.energies is None:
             self.energies = self.func(r)
 
-        for i in range(optimizable.batch_size):
-            if self.ls_completed[i]:
-                p = -torch.matmul(self.Hs[i], g[idx_t == i])
+        with self._time_section("direction_calc"):
+            for i in range(optimizable.batch_size):
+                if self.ls_completed[i]:
+                    p = -torch.matmul(self.Hs[i], g[idx_t == i])
 
-                # Implement scaling for numerical stability with simpler calculation
-                p_size = torch.sqrt((p**2).sum())
-                min_size = torch.sqrt(optimizable.elem_per_group[i] * 1e-10)
-                if p_size <= min_size:
-                    p = p * (min_size / p_size)
+                    # Implement scaling for numerical stability with simpler calculation
+                    p_size = torch.sqrt((p**2).sum())
+                    min_size = torch.sqrt(optimizable.elem_per_group[i] * 1e-10)
+                    if p_size <= min_size:
+                        p = p * (min_size / p_size)
 
-                self.p_list[i] = p
+                    self.p_list[i] = p
 
         continue_search = [not elem for elem in self.ls_completed]
         self.alpha_k_list, self.e_list, self.e0_list, self.no_update_list, self.ls_completed = self.ls_batch._linesearch_batch(
             self.func, self.fprime, r, self.p_list, g, self.energies, None,
-            maxstep=self.maxstep, c1=self.c1, c2=self.c2, stpmax=self.stpmax, continue_search=continue_search
+            maxstep=self.maxstep,
+            c1=self.c1,
+            c2=self.c2,
+            stpmax=self.stpmax,
+            continue_search=continue_search,
+            profiler_section=self._time_section if self.use_profiler else None,
         )
 
         # reset device for linesearch result
-        for i in range(optimizable.batch_size):
-            if self.ls_completed[i]:
-                self.alpha_k_list[i] = self.alpha_k_list[i].to(self.device)
-                self.p_list[i] = self.p_list[i].to(self.device)
+        with self._time_section("host_device_transfer"):
+            for i in range(optimizable.batch_size):
+                if self.ls_completed[i]:
+                    self.alpha_k_list[i] = self.alpha_k_list[i].to(self.device)
+                    self.p_list[i] = self.p_list[i].to(self.device)
         
-        dr_tensor = torch.zeros_like(r)
+        with self._time_section("position_filter_update"):
+            dr_tensor = torch.zeros_like(r)
 
-        for i in range(optimizable.batch_size):
-            if not self.ls_completed[i]:
-                continue
-            if self.alpha_k_list[i] is None:
-                raise RuntimeError("LineSearch failed!")
-            
-            mask = (i == idx_t)
-            dr_tensor[mask] = self.alpha_k_list[i] * self.p_list[i]
+            for i in range(optimizable.batch_size):
+                if not self.ls_completed[i]:
+                    continue
+                if self.alpha_k_list[i] is None:
+                    raise RuntimeError("LineSearch failed!")
+
+                mask = (i == idx_t)
+                dr_tensor[mask] = self.alpha_k_list[i] * self.p_list[i]
 
         # TODO: get_forces/get_potential_energies will trigger compare_batch which is time-consuming
         forces_cache = optimizable.get_forces()
@@ -158,7 +231,8 @@ class BFGSFusedLS:
             self.forces[mask] = forces_cache[mask]
             self.energies[i] = energies_cache[i]
 
-        optimizable.set_positions((r + dr_tensor).reshape(-1, 3))
+        with self._time_section("position_filter_update"):
+            optimizable.set_positions((r + dr_tensor).reshape(-1, 3))
 
         self.r0 = r
         self.g0 = g
@@ -392,7 +466,7 @@ class BFGSFusedLS:
                     
                     # Step the profiler in each iteration
                     prof.step()
-                
+
         else:
             # Original optimization loop without profiling
             while iteration < self.max_iter and not self.optimizable.converged(
@@ -547,7 +621,7 @@ class LineSearch:
 
             if self.task[:2] == 'FG':
                 alpha1 = stp
-                
+
                 # Get function value and gradient
                 x_new = xk + stp * pk_tensor
                 fval = func(x_new).to(self.device)
@@ -904,7 +978,8 @@ class LineSearchBatch:
 
     def _linesearch_batch(self, func, myfprime, xk, pk, gfk, old_fval, old_old_fval,
                             maxstep=.2, c1=.23, c2=0.46, xtrapl=1.1, xtrapu=4.,
-                            stpmax=50., stpmin=1e-8, continue_search=None, max_iter=15):
+                            stpmax=50., stpmin=1e-8, continue_search=None, max_iter=15,
+                            profiler_section=None):
         if continue_search is None:
             self.linesearch_list = [LineSearch(device=self.device) for _ in range(self.batch_size)]
         else:
@@ -913,16 +988,22 @@ class LineSearchBatch:
                 if not continue_search[i]:
                     self.linesearch_list[i] = LineSearch(device=self.device)
         
-        if isinstance(xk, torch.Tensor):
-            xk = xk.to(self.device)
-        for i in range(len(pk)): 
-            pk[i] = pk[i].to(self.device)
-        if isinstance(gfk, torch.Tensor):
-            gfk = gfk.to(self.device)
-        if isinstance(old_fval, torch.Tensor):
-            old_fval = old_fval.to(self.device)
-        if isinstance(old_old_fval, torch.Tensor):
-            old_old_fval = old_old_fval.to(self.device)
+        transfer_context = (
+            profiler_section("host_device_transfer")
+            if profiler_section is not None
+            else nullcontext()
+        )
+        with transfer_context:
+            if isinstance(xk, torch.Tensor):
+                xk = xk.to(self.device)
+            for i in range(len(pk)):
+                pk[i] = pk[i].to(self.device)
+            if isinstance(gfk, torch.Tensor):
+                gfk = gfk.to(self.device)
+            if isinstance(old_fval, torch.Tensor):
+                old_fval = old_fval.to(self.device)
+            if isinstance(old_old_fval, torch.Tensor):
+                old_old_fval = old_old_fval.to(self.device)
 
 
         # results for each batch element
@@ -938,68 +1019,100 @@ class LineSearchBatch:
         iter_count = 0
 
         # Initialize all line searches using the initialize method
-        for i in range(self.batch_size):
-            if continue_search[i]:
-                continue
+        with (
+            profiler_section("linesearch_state")
+            if profiler_section is not None
+            else nullcontext()
+        ):
+            for i in range(self.batch_size):
+                if continue_search[i]:
+                    continue
 
-            ls = self.linesearch_list[i]
-            mask = (i == self.batch_indices_flatten)
-            
-            # Use the initialize method to set up line search parameters
-            alpha1, phi0, derphi0 = ls.initialize(
-                xk[mask], pk[i], gfk[mask], old_fval[i], old_old_fval,
-                maxstep, c1, c2, xtrapl, xtrapu, stpmax, stpmin
-            )
-            
-            # Store the initialization values
-            self.steps[i] = alpha1
-            self.phi0_values[i] = phi0
-            self.derphi0_values[i] = derphi0
+                ls = self.linesearch_list[i]
+                mask = (i == self.batch_indices_flatten)
+
+                # Use the initialize method to set up line search parameters
+                alpha1, phi0, derphi0 = ls.initialize(
+                    xk[mask], pk[i], gfk[mask], old_fval[i], old_old_fval,
+                    maxstep, c1, c2, xtrapl, xtrapu, stpmax, stpmin
+                )
+
+                # Store the initialization values
+                self.steps[i] = alpha1
+                self.phi0_values[i] = phi0
+                self.derphi0_values[i] = derphi0
         
         # Main optimization loop
         while True:
             # 1. step forward
             # logging.info(f"step's input: alpha1: {torch.tensor([step.item() if isinstance(step, torch.Tensor) else step for step in self.steps])}")
-            for i in range(self.batch_size):
-                if completed[i]:
-                    continue
-                ls = self.linesearch_list[i]
-                if ls.fc > max_iter:
-                    completed[i] = True
-                    logging.debug(f"LineSearchBatch[{i}] reached max_iter: {max_iter}")
-                    continue
-                stp = ls.step(self.steps[i], self.phi0_values[i], self.derphi0_values[i], 
-                                c1, c2, ls.xtol, ls.isave, ls.dsave)
-                if ls.task[:2] == 'FG':
-                    self.steps[i] = stp
-                else:
-                    completed[i] = True
+            with (
+                profiler_section("linesearch_state")
+                if profiler_section is not None
+                else nullcontext()
+            ):
+                for i in range(self.batch_size):
+                    if completed[i]:
+                        continue
+                    ls = self.linesearch_list[i]
+                    if ls.fc > max_iter:
+                        completed[i] = True
+                        logging.debug(f"LineSearchBatch[{i}] reached max_iter: {max_iter}")
+                        continue
+                    stp = ls.step(self.steps[i], self.phi0_values[i], self.derphi0_values[i],
+                                    c1, c2, ls.xtol, ls.isave, ls.dsave)
+                    if ls.task[:2] == 'FG':
+                        self.steps[i] = stp
+                    else:
+                        completed[i] = True
                         
             # 2. calculate new function value and gradient
-            x_new_batch = torch.zeros_like(xk)
-            for i in range(self.batch_size):
-                mask = (i == self.batch_indices_flatten)
-                x_new_batch[mask] = xk[mask] + self.steps[i] * pk[i]
-            f_batch = func(x_new_batch).to(self.device)
-            g_batch = myfprime(x_new_batch).to(self.device)
+            with (
+                profiler_section("linesearch_state")
+                if profiler_section is not None
+                else nullcontext()
+            ):
+                x_new_batch = torch.zeros_like(xk)
+                for i in range(self.batch_size):
+                    mask = (i == self.batch_indices_flatten)
+                    x_new_batch[mask] = xk[mask] + self.steps[i] * pk[i]
+            f_batch = func(x_new_batch)
+            with (
+                profiler_section("host_device_transfer")
+                if profiler_section is not None
+                else nullcontext()
+            ):
+                f_batch = f_batch.to(self.device)
+            g_batch = myfprime(x_new_batch)
+            with (
+                profiler_section("host_device_transfer")
+                if profiler_section is not None
+                else nullcontext()
+            ):
+                g_batch = g_batch.to(self.device)
 
             # 3. update function value and gradient
-            for i in range(self.batch_size):
-                ls = self.linesearch_list[i]
-                mask = (i == self.batch_indices_flatten)
-                if ls.task[:2] == 'FG':
-                    # Update function value and gradient
-                    f_val = f_batch[i:i+1]
-                    g_val = g_batch[mask]
-                    ls.fc += 1
-                    phi0, derphi0 = ls.prologue(f_val, g_val, pk[i], self.steps[i])
-                    # logging.info(f"phi0, derphi0: {phi0}, {derphi0}")
-                    self.phi0_values[i] = phi0
-                    self.derphi0_values[i] = derphi0 # TODO: why we put the derphi0 here instead of set it inside the LineSearch class?
-                    if ls.no_update:
+            with (
+                profiler_section("linesearch_state")
+                if profiler_section is not None
+                else nullcontext()
+            ):
+                for i in range(self.batch_size):
+                    ls = self.linesearch_list[i]
+                    mask = (i == self.batch_indices_flatten)
+                    if ls.task[:2] == 'FG':
+                        # Update function value and gradient
+                        f_val = f_batch[i:i+1]
+                        g_val = g_batch[mask]
+                        ls.fc += 1
+                        phi0, derphi0 = ls.prologue(f_val, g_val, pk[i], self.steps[i])
+                        # logging.info(f"phi0, derphi0: {phi0}, {derphi0}")
+                        self.phi0_values[i] = phi0
+                        self.derphi0_values[i] = derphi0 # TODO: why we put the derphi0 here instead of set it inside the LineSearch class?
+                        if ls.no_update:
+                            completed[i] = True
+                    else:
                         completed[i] = True
-                else:
-                    completed[i] = True
 
             iter_count += 1
             logging.debug(f"LineSearchBatch iter: {iter_count}: alpha: {torch.tensor([step.item() if isinstance(step, torch.Tensor) else step for step in self.steps])}")
@@ -1014,17 +1127,22 @@ class LineSearchBatch:
             #     break
         
         # Collect results
-        for i in range(self.batch_size):
-            ls = self.linesearch_list[i]
-            if ls.task[:5] == 'ERROR' or ls.task[1:4] == 'WARN':
-                stp = torch.tensor(1., device=self.device)
-            else:
-                stp = self.steps[i] if isinstance(self.steps[i], torch.Tensor) else torch.tensor(self.steps[i], device=self.device)
-                
-            alpha_results.append(stp)
-            e_result.append(self.phi0_values[i].item() if self.phi0_values[i] is not None else None)
-            e0_result.append(old_fval[i].item() if isinstance(old_fval[i], torch.Tensor) else old_fval[i])
-            no_update_result.append(ls.no_update)
+        with (
+            profiler_section("linesearch_state")
+            if profiler_section is not None
+            else nullcontext()
+        ):
+            for i in range(self.batch_size):
+                ls = self.linesearch_list[i]
+                if ls.task[:5] == 'ERROR' or ls.task[1:4] == 'WARN':
+                    stp = torch.tensor(1., device=self.device)
+                else:
+                    stp = self.steps[i] if isinstance(self.steps[i], torch.Tensor) else torch.tensor(self.steps[i], device=self.device)
+
+                alpha_results.append(stp)
+                e_result.append(self.phi0_values[i].item() if self.phi0_values[i] is not None else None)
+                e0_result.append(old_fval[i].item() if isinstance(old_fval[i], torch.Tensor) else old_fval[i])
+                no_update_result.append(ls.no_update)
 
         logging.debug(f"LineSearchBatch finished in {iter_count} iterations. \
                      LineSearch Status: {[stat for stat in completed]}")

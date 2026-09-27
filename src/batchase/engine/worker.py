@@ -103,6 +103,9 @@ class Worker:
         self.use_profiler = kwargs.get("use_profiler", False)
         self.profiler_log_dir = kwargs.get("profiler_log_dir", None)
         self.profiler_schedule_config = kwargs.get("profiler_schedule_config", None)
+        if self.use_profiler and self.profiler_log_dir is None:
+            self.profiler_log_dir = os.path.join(self.output_path, "log")
+            ensure_directory(self.profiler_log_dir)
 
         if str(device).startswith("cuda"):
             dev_idx = int(str(device).split(":")[-1]) if ":" in str(device) else 0
@@ -618,6 +621,49 @@ class Worker:
             f"{self.worker_tag} [{stage_name}] completed: {len(files)} structures in {stage_total_time:.2f}s "
             f"({len(stage_success_cifs)} qualified for next stage, peak_vram: {vram_gb:.2f} GB)"
         )
+        profiler_breakdown = None
+        get_profiler_breakdown = getattr(batch_optimizer, "get_profiler_breakdown", None)
+        if self.use_profiler and callable(get_profiler_breakdown):
+            profiler_breakdown = get_profiler_breakdown()
+            measured_optimizer_s = float(
+                profiler_breakdown.get("measured_total_s", 0.0)
+            )
+            optimizer_wall_s = float(final_opt_time)
+            unprofiled_optimizer_s = max(
+                optimizer_wall_s - measured_optimizer_s, 0.0
+            )
+            profiler_coverage_pct = (
+                100.0 * measured_optimizer_s / optimizer_wall_s
+                if optimizer_wall_s > 0.0
+                else 0.0
+            )
+            unprofiled_optimizer_pct = (
+                100.0 * unprofiled_optimizer_s / optimizer_wall_s
+                if optimizer_wall_s > 0.0
+                else 0.0
+            )
+            profiler_breakdown.update(
+                {
+                    "optimizer_wall_s": optimizer_wall_s,
+                    "unprofiled_optimizer_s": unprofiled_optimizer_s,
+                    "unprofiled_optimizer_ms": unprofiled_optimizer_s * 1000.0,
+                    "unprofiled_optimizer_pct": unprofiled_optimizer_pct,
+                    "profiler_coverage_pct": profiler_coverage_pct,
+                }
+            )
+            percentages = ", ".join(
+                f"{name[:-4]}={value:.1f}%"
+                for name, value in profiler_breakdown.items()
+                if name.endswith("_pct")
+                and name not in {"unprofiled_optimizer_pct", "profiler_coverage_pct"}
+            )
+            logger.info(
+                f"{self.worker_tag} [{stage_name}] profiler breakdown: "
+                f"{percentages or 'no measured sections'}; "
+                f"measured={measured_optimizer_s:.2f}s "
+                f"unprofiled={unprofiled_optimizer_s:.2f}s "
+                f"coverage={profiler_coverage_pct:.1f}%"
+            )
         stage_metrics = {
             "structures": len(files),
             "converged": len(stage_success_cifs),
@@ -636,6 +682,8 @@ class Worker:
             "max_structure_failed_reason": max_structure_failed_reason,
             "max_structure_fmax": max_structure_fmax,
         }
+        if profiler_breakdown is not None:
+            stage_metrics["profiler_breakdown"] = profiler_breakdown
         return stage_success_cifs, stage_metrics
 
     def run(self) -> None:

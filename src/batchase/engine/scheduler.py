@@ -173,7 +173,7 @@ class Scheduler:
 
         self.profile = kwargs.pop("profile", "False")
         self.use_profiler = False
-        self.profiler_schedule_config = {"wait": 48, "warmup": 1, "active": 1, "repeat": 1}
+        self.profiler_schedule_config = {"wait": 0, "warmup": 0, "active": 1, "repeat": 1}
         self.profiler_log_dir = None
         if self.profile and str(self.profile).lower() != "false":
             self.use_profiler = True
