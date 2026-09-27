@@ -511,7 +511,7 @@ class OptimizableBatch(Optimizable):
     def get_volumes(self) -> torch.Tensor:
         """Get a tensor of volumes for each cell in batch"""
         cells = self.get_cells()
-        return torch.linalg.det(cells)
+        return torch.linalg.det(cells).abs()
 
     def iterimages(self) -> Generator[Batch, None, None]:
         # XXX document purpose of iterimages - this is just needed to work with ASE optimizers

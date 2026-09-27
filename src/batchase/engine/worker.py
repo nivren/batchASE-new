@@ -103,6 +103,8 @@ class Worker:
         """Compute crystal density in g/cm^3."""
         try:
             vol = atoms.get_volume()
+            if not np.isfinite(vol) or vol <= 1e-6:
+                return 0.0
             mass = sum(atoms.get_masses())
             return (mass / vol) * 1.66053906660
         except Exception:
