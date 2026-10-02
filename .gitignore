@@ -21,6 +21,7 @@ venv/
 *.swp
 
 # Testing & caching
+.cache/
 .pytest_cache/
 .coverage
 htmlcov/

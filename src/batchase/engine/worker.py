@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 import numpy as np
@@ -18,6 +19,8 @@ from ase.io import read
 from ..neighbors import AtomsToGraphs
 from ..utils import data_list_collater, ensure_directory
 from ..potentials import create_backend
+from .batching import build_batch_plan
+from .metrics import merge_stage_metrics
 from ..relaxation import (
     OptimizableBatch,
     OptimizableUnitCellBatch,
@@ -56,6 +59,10 @@ class Worker:
         bfgs_cpu_thread: int = 1,
         worker_id: int = 0,
         compile_mode: Optional[str] = None,
+        batch_mode: str = "bsize",
+        structure_order: str = "rand",
+        structure_order_seed: int = 42,
+        num_structures: int = 0,
         **kwargs,
     ) -> None:
         if isinstance(files, (str, Path)):
@@ -68,9 +75,19 @@ class Worker:
         else:
             self.files = list(files)
 
+        self.fixed_one_batch = bool(kwargs.get("fixed_one_batch", False))
+        self.batch_queue = kwargs.pop("batch_queue", None)
+        self.batch_plan_path = kwargs.pop("batch_plan_path", None)
+        self.run_id = kwargs.pop("run_id", None) or uuid.uuid4().hex
+        self.batch_mode = batch_mode
+        self.structure_order = structure_order
+        self.structure_order_seed = int(structure_order_seed)
+        self.num_structures = num_structures
+
         self.device = device
         self.worker_id = int(kwargs.get("worker_id", worker_id))
         self.batch_size = batch_size
+        self.max_batch_atoms = max(0, int(kwargs.get("max_batch_atoms", 0) or 0))
         self.max_steps = max_steps
         self.fmax = fmax
         self.fmax1 = fmax1 if fmax1 is not None else fmax
@@ -143,10 +160,10 @@ class Worker:
         a2g: AtomsToGraphs,
         fmax: Optional[float] = None,
     ) -> tuple[List[str], Dict[str, Any]]:
-        """Execute one complete relaxation stage with true continuous batch replenishment."""
+        """Run one complete batch, compacting finished slots without replenishment."""
         stage_fmax = fmax if fmax is not None else self.fmax
         logger.info(
-            f"{self.worker_tag} Starting {stage_name} on {len(files)} files with {optimizer_name} (filter={filter_type}, fmax={stage_fmax})."
+            f"{self.worker_tag} Starting {stage_name} on {len(files)} files with {optimizer_name} (filter={filter_type}, fmax={stage_fmax}, batch_size={self.batch_size}, max_batch_atoms={self.max_batch_atoms or 'disabled'})."
         )
         cif_dir = ensure_directory(os.path.join(self.output_path, f"cif_result_{stage_name}"))
         json_dir = ensure_directory(os.path.join(self.output_path, f"json_result_{stage_name}"))
@@ -166,14 +183,21 @@ class Worker:
             "max_structure_status": "",
             "max_structure_failed_reason": "",
             "max_structure_fmax": None,
+            "max_batch_atoms": self.max_batch_atoms,
+            "max_observed_batch_atoms": 0,
         }
         if not files:
             return [], empty_metrics
 
-        # Initial batch loading
-        cur_batch_path = files[: self.batch_size]
-        indices_to_process = len(cur_batch_path)
-        optimized_atoms = [read(p) for p in cur_batch_path]
+        # The entire group is loaded, regardless of the configured BATCH_SIZE.
+        cur_batch_path = list(files)
+        optimized_atoms = [read(path) for path in files]
+        current_batch_atoms = sum(len(atoms) for atoms in optimized_atoms)
+        if self.max_batch_atoms and current_batch_atoms > self.max_batch_atoms:
+            raise ValueError(
+                f"Loaded batch exceeds atom budget: {current_batch_atoms} > {self.max_batch_atoms}"
+            )
+        max_observed_batch_atoms = current_batch_atoms
 
         gbatch = data_list_collater([a2g.convert(a) for a in optimized_atoms]).to(self.device)
         if filter_type == "UnitCellFilter":
@@ -207,7 +231,7 @@ class Worker:
             "early_stop": True,
             "f_upper_limit": self.f_upper_limit,
         }
-        if optimizer_key == "bfgs":
+        if optimizer_key in ("bfgs", "quasinewton"):
             opt_kwargs["alpha"] = 70.0
             opt_kwargs["bfgs_cpu_thread"] = self.bfgs_cpu_thread
         elif optimizer_key in ("bfgsfusedls", "bfgslinesearch"):
@@ -240,7 +264,7 @@ class Worker:
         max_structure_fmax = None
 
         while converged_atoms_count < len(files):
-            # Dynamic batch replenishment when structures finish
+            # Compact completed slots, retaining optimizer state for survivors.
             if len(all_indices) > 0:
                 restart_indices = [i for i in range(len(optimized_atoms)) if i not in all_indices]
                 old_batch_indices = obatch.batch_indices
@@ -249,17 +273,6 @@ class Worker:
                 cur_batch_path_new = [cur_batch_path[i] for i in restart_indices]
                 cur_batch_steps_new = [cur_batch_steps[i] for i in restart_indices]
                 cur_batch_times_new = [cur_batch_times[i] for i in restart_indices]
-
-                # Fill empty slots up to batch_size
-                num_needed = self.batch_size - len(optimized_atoms_new)
-                new_paths = files[indices_to_process : indices_to_process + num_needed]
-                indices_to_process += len(new_paths)
-
-                for new_path in new_paths:
-                    optimized_atoms_new.append(read(new_path))
-                    cur_batch_path_new.append(new_path)
-                    cur_batch_steps_new.append(0)
-                    cur_batch_times_new.append(time.perf_counter())
 
                 if not optimized_atoms_new:
                     break
@@ -675,6 +688,8 @@ class Worker:
             "opt_s": final_opt_time,
             "graph_s": final_graph_time,
             "io_s": final_io_time,
+            "max_batch_atoms": self.max_batch_atoms,
+            "max_observed_batch_atoms": max_observed_batch_atoms,
             "peak_vram_gb": vram_gb,
             "max_structure_steps": max_structure_steps,
             "max_structure_file": max_structure_file,
@@ -686,90 +701,135 @@ class Worker:
             stage_metrics["profiler_breakdown"] = profiler_breakdown
         return stage_success_cifs, stage_metrics
 
-    def run(self) -> None:
-        """Run complete 2-stage or 1-stage relaxation pipeline."""
-        logger.info(f"{self.worker_tag} Worker started with {len(self.files)} files.")
-        a2g = AtomsToGraphs(r_edges=False, r_pbc=True, dtype=torch.float64)
-        backend = create_backend(
-            self.model,
-            device=self.device,
-            enable_cueq=self.cueq,
-            use_fasteq=self.use_fasteq,
-            compile_mode=self.compile_mode,
+    def _iter_batches(self, plan):
+        if self.batch_queue is not None:
+            while True:
+                batch_id = self.batch_queue.get()
+                if batch_id is None:
+                    return
+                yield plan["batches"][batch_id]
+        elif self.fixed_one_batch and self.batch_plan_path:
+            yield plan["batches"][self.worker_id]
+        else:
+            yield from plan["batches"]
+
+    def _run_complete_batch(self, batch, backend, a2g):
+        """Finish both stages of one batch before claiming any other work."""
+        batch_start = time.perf_counter()
+        logger.info(
+            f"{self.worker_tag} Starting batch {batch['batch_id']}: "
+            f"{batch['nfiles']} structures, {batch['natoms']} atoms."
         )
-
-        worker_start_time = time.perf_counter()
-
-        # Stage 1: Pressure relaxation
+        stages = {}
+        original_batch_size = self.batch_size
         try:
-            s1_cifs, s1_metrics = self._run_stage(
-                files=self.files,
-                stage_name="press",
-                filter_type=self.filter1,
-                optimizer_name=self.optimizer1,
-                scalar_pressure=self.scalar_pressure,
-                backend=backend,
-                a2g=a2g,
-                fmax=self.fmax1,
-            )
-        finally:
-            self._clear_stage_memory()
-
-        stages_dict = {"press": s1_metrics}
-
-        # Stage 2: Final relaxation
-        if not self.skip_second_stage and s1_cifs:
+            self.batch_size = batch["nfiles"]
             try:
-                s2_cifs, s2_metrics = self._run_stage(
-                    files=s1_cifs,
-                    stage_name="final",
-                    filter_type=self.filter2,
-                    optimizer_name=self.optimizer2,
-                    scalar_pressure=0.0,
-                    backend=backend,
-                    a2g=a2g,
-                    fmax=self.fmax2,
+                success_cifs, press_metrics = self._run_stage(
+                    files=batch["files"], stage_name="press", filter_type=self.filter1,
+                    optimizer_name=self.optimizer1, scalar_pressure=self.scalar_pressure,
+                    backend=backend, a2g=a2g, fmax=self.fmax1,
                 )
+                stages["press"] = press_metrics
             finally:
                 self._clear_stage_memory()
-            stages_dict["final"] = s2_metrics
-
-        total_elapsed = time.perf_counter() - worker_start_time
-        vram_gb = (
-            torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
-            if str(self.device).startswith("cuda")
-            else 0.0
-        )
-
-        total_batch_iterations = sum(
-            m.get("batch_iterations", m.get("steps", 0)) for m in stages_dict.values()
-        )
-        total_mace = sum(m.get("mace_s", 0.0) for m in stages_dict.values())
-        total_opt = sum(m.get("opt_s", 0.0) for m in stages_dict.values())
-        total_graph = sum(m.get("graph_s", 0.0) for m in stages_dict.values())
-        total_io = sum(m.get("io_s", 0.0) for m in stages_dict.values())
-
-        worker_metrics = {
+            if not self.skip_second_stage and success_cifs:
+                self.batch_size = len(success_cifs)
+                try:
+                    _, final_metrics = self._run_stage(
+                        files=success_cifs, stage_name="final", filter_type=self.filter2,
+                        optimizer_name=self.optimizer2, scalar_pressure=0.0,
+                        backend=backend, a2g=a2g, fmax=self.fmax2,
+                    )
+                    stages["final"] = final_metrics
+                finally:
+                    self._clear_stage_memory()
+        finally:
+            self.batch_size = original_batch_size
+        return {
+            **batch,
+            "run_id": self.run_id,
             "worker_id": self.worker_id,
             "device": str(self.device),
-            "stages": stages_dict,
-            "total_elapsed_s": total_elapsed,
-            "total_steps": total_batch_iterations,
-            "total_batch_iterations": total_batch_iterations,
-            "mace_s": total_mace,
-            "opt_s": total_opt,
-            "graph_s": total_graph,
-            "io_s": total_io,
-            "peak_vram_gb": vram_gb,
+            "status": "completed",
+            "stages": stages,
+            "total_elapsed_s": time.perf_counter() - batch_start,
+            "peak_vram_gb": max((stage.get("peak_vram_gb", 0.0) for stage in stages.values()), default=0.0),
         }
 
-        metrics_dir = os.path.join(self.output_path, "metrics")
-        ensure_directory(metrics_dir)
-        metric_file = os.path.join(metrics_dir, f"worker_{self.worker_id}.json")
-        try:
-            with open(metric_file, "w", encoding="utf-8") as f:
-                json.dump(worker_metrics, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to write worker metrics: {e}")
+    def _write_worker_metrics(self, stages, records, elapsed, status):
+        iterations = sum(metrics.get("batch_iterations", 0) for metrics in stages.values())
+        worker_metrics = {
+            "run_id": self.run_id,
+            "worker_id": self.worker_id,
+            "device": str(self.device),
+            "status": status,
+            "stages": stages,
+            "batch_ids": [record["batch_id"] for record in records],
+            "num_batches": len(records),
+            "batches": records,
+            "total_elapsed_s": elapsed,
+            "total_steps": iterations,
+            "total_batch_iterations": iterations,
+            "peak_vram_gb": max((stage.get("peak_vram_gb", 0.0) for stage in stages.values()), default=0.0),
+        }
+        for key in ("mace_s", "opt_s", "graph_s", "io_s"):
+            worker_metrics[key] = sum(metrics.get(key, 0.0) for metrics in stages.values())
+        path = Path(ensure_directory(Path(self.output_path) / "metrics")) / f"worker_{self.worker_id}.json"
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(worker_metrics, handle, indent=2)
 
-        logger.info(f"{self.worker_tag} Worker finished all stages in {total_elapsed:.2f}s.")
+    def run(self) -> None:
+        """Keep a backend alive while processing complete queued batches."""
+        if self.batch_plan_path:
+            with open(self.batch_plan_path, encoding="utf-8") as handle:
+                plan = json.load(handle)
+            if plan["run_id"] != self.run_id:
+                raise ValueError("Worker received a batch plan from a different run")
+        elif self.fixed_one_batch:
+            # Direct external Worker use still executes exactly one batch.
+            from .batching import count_structure_atoms, describe_batch
+            counts = {path: count_structure_atoms(path) for path in self.files}
+            plan = {"max_batch_atoms": self.max_batch_atoms,
+                    "batches": [describe_batch(self.files, counts, self.worker_id, self.max_batch_atoms)]}
+        else:
+            plan = build_batch_plan(
+                self.files, self.batch_mode, self.batch_size, self.max_batch_atoms,
+                self.structure_order, self.structure_order_seed,
+                num_structures=self.num_structures,
+            )
+        self.max_batch_atoms = plan["max_batch_atoms"]
+        batches = iter(self._iter_batches(plan))
+        first_batch = next(batches, None)
+        if first_batch is None:
+            self._write_worker_metrics({}, [], 0.0, "completed")
+            return
+
+        a2g = AtomsToGraphs(r_edges=False, r_pbc=True, dtype=torch.float64)
+        backend = create_backend(
+            self.model, device=self.device, enable_cueq=self.cueq,
+            use_fasteq=self.use_fasteq, compile_mode=self.compile_mode,
+        )
+        worker_start = time.perf_counter()
+        stages = {}
+        records = []
+        status = "failed"
+        metrics_dir = Path(ensure_directory(Path(self.output_path) / "metrics"))
+        batch = first_batch
+        try:
+            while batch is not None:
+                if str(self.device).startswith("cuda"):
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                record = self._run_complete_batch(batch, backend, a2g)
+                with (metrics_dir / f"batch_{batch['batch_id']}.json").open("w", encoding="utf-8") as handle:
+                    json.dump(record, handle, indent=2)
+                records.append(record)
+                for name, metrics in record["stages"].items():
+                    merge_stage_metrics(stages.setdefault(name, {}), metrics)
+                # next() may block; no batch graphs or optimizer states remain.
+                batch = next(batches, None)
+            status = "completed"
+        finally:
+            elapsed = time.perf_counter() - worker_start
+            self._write_worker_metrics(stages, records, elapsed, status)
+        logger.info(f"{self.worker_tag} Completed {len(records)} batches in {elapsed:.2f}s.")

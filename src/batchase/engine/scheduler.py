@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from statistics import fmean, median
 import time
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import List, Optional
 import torch.multiprocessing as mp
 
 from .worker import Worker
+from .batching import count_structure_atoms, describe_batch, select_structure_files
+from .batch_cache import load_or_build_batch_plan
 from ..utils import ensure_directory
 
 logger = logging.getLogger("batchase.engine.scheduler")
@@ -134,9 +137,18 @@ class Scheduler:
         molecule_single: Optional[int] = None,
         bfgs_cpu_thread: int = 1,
         compile_mode: Optional[str] = None,
+        batch_mode: str = "bsize",
+        max_batch_atoms: int = 0,
+        structure_order: str = "rand",
+        structure_order_seed: int = 42,
+        fixed_batch_plan: Optional[str] = None,
+        batch_plan_cache_dir: Optional[str] = None,
+        batch_plan_cache_limit: int = 20,
+        num_structures: int = 0,
         **kwargs,
     ) -> None:
-        self.files = list(files)
+        self._candidate_files = list(files)
+        self.files = list(self._candidate_files)
         self.num_workers = max(1, num_workers)
         self.devices = devices or ["cuda:0"]
         self.batch_size = batch_size
@@ -167,6 +179,19 @@ class Scheduler:
             self.molecule_single = parsed_molecule_single
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.pop("compile_mode", None)
+        self.batch_mode = batch_mode
+        self.max_batch_atoms = int(max_batch_atoms)
+        self.structure_order = structure_order
+        self.structure_order_seed = int(structure_order_seed)
+        if not isinstance(num_structures, int) or num_structures < 0:
+            raise ValueError("num_structures must be a nonnegative integer")
+        self.num_structures = num_structures
+        self.batch_plan_cache_dir = batch_plan_cache_dir
+        self.batch_plan_cache_limit = batch_plan_cache_limit
+        # Strict one-round mode: one precomputed batch per worker, with no
+        # refill queue.  The selector may reduce the input set so this plan
+        # fits the atom budget while retaining exactly num_workers batches.
+        self.fixed_batch_plan = fixed_batch_plan
 
         self.bind_cores = kwargs.pop("bind_cores", None)
         self.cpu_masks = self._parse_bind_cores(self.bind_cores)
@@ -211,89 +236,237 @@ class Scheduler:
                 return None
         return bindings
 
-    def run(self) -> None:
-        """Partition files and execute worker processes."""
-        start_time = time.perf_counter()
-        logger.info(
-            f"Scheduler starting: {len(self.files)} files, {self.num_workers} workers, devices={self.devices}"
-        )
+    def _load_fixed_batch_plan(self):
+        """Load and validate an exact one-batch-per-worker plan."""
+        if not self.fixed_batch_plan:
+            raise ValueError("fixed_batch_plan is empty")
+        plan_path = os.path.abspath(os.fspath(self.fixed_batch_plan))
+        with open(plan_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        raw_workers = raw.get("workers") if isinstance(raw, dict) else raw
+        if not isinstance(raw_workers, list) or len(raw_workers) != self.num_workers:
+            raise ValueError(
+                f"fixed_batch_plan must contain exactly {self.num_workers} workers; "
+                f"got {len(raw_workers) if isinstance(raw_workers, list) else type(raw_workers).__name__}"
+            )
+
+        assignments = []
+        for worker_id, item in enumerate(raw_workers):
+            files = item.get("files") if isinstance(item, dict) else item
+            if not isinstance(files, list) or not files:
+                raise ValueError(f"fixed_batch_plan worker {worker_id} has no files")
+            assignments.append([os.path.abspath(os.fspath(path)) for path in files])
+
+        expected = {os.path.abspath(os.fspath(path)) for path in self.files}
+        actual = [path for batch in assignments for path in batch]
+        actual_set = set(actual)
+        if len(actual) != len(actual_set):
+            raise ValueError("fixed_batch_plan contains duplicate input files")
+        if actual_set != expected:
+            missing = sorted(expected - actual_set)
+            extra = sorted(actual_set - expected)
+            raise ValueError(
+                "fixed_batch_plan file union does not match scheduler inputs "
+                f"(missing={len(missing)}, extra={len(extra)})"
+            )
+
+        worker_atoms = []
+        for worker_id, files in enumerate(assignments):
+            atom_total = sum(count_structure_atoms(path) for path in files)
+            worker_atoms.append(atom_total)
+            if self.max_batch_atoms and atom_total > self.max_batch_atoms:
+                raise ValueError(
+                    f"fixed_batch_plan worker {worker_id} exceeds atom budget: "
+                    f"{atom_total} > {self.max_batch_atoms}"
+                )
+        return assignments, worker_atoms, raw
+
+    def _worker_kwargs(self, worker_id, files, **batch_kwargs):
+        kwargs = {
+            "files": files,
+            "device": self.devices[worker_id % len(self.devices)],
+            "worker_id": worker_id,
+            "batch_size": self.batch_size,
+            "batch_mode": self.batch_mode,
+            "max_batch_atoms": self.max_batch_atoms,
+            "structure_order": self.structure_order,
+            "structure_order_seed": self.structure_order_seed,
+            "max_steps": self.max_steps,
+            "fmax": self.fmax,
+            "fmax1": self.fmax1,
+            "fmax2": self.fmax2,
+            "filter1": self.filter1,
+            "filter2": self.filter2,
+            "optimizer1": self.optimizer1,
+            "optimizer2": self.optimizer2,
+            "skip_second_stage": self.skip_second_stage,
+            "scalar_pressure": self.scalar_pressure,
+            "molecule_single": self.molecule_single,
+            "output_path": self.output_path,
+            "model": self.model,
+            "use_fasteq": self.use_fasteq,
+            "cueq": self.cueq,
+            "bfgs_cpu_thread": self.bfgs_cpu_thread,
+            "compile_mode": self.compile_mode,
+            "use_profiler": self.use_profiler,
+            "profiler_log_dir": self.profiler_log_dir,
+            "profiler_schedule_config": self.profiler_schedule_config,
+            **self.extra_kwargs,
+            **batch_kwargs,
+        }
         if self.cpu_masks is not None:
-            logger.info(f"Custom core binding active for {len(self.cpu_masks)} workers.")
+            kwargs["affinity_cores"] = self.cpu_masks[worker_id]
+        return kwargs
 
-        # Distribute files evenly among workers
-        file_chunks = [[] for _ in range(self.num_workers)]
-        for i, file_path in enumerate(self.files):
-            file_chunks[i % self.num_workers].append(file_path)
-
-        manifest_dir = os.path.join(self.output_path, "manifests")
+    def _execute_workers(self, ctx, workers):
+        """Stop promptly on a process failure instead of reporting success."""
         processes = []
-        for worker_id in range(self.num_workers):
-            chunk = file_chunks[worker_id]
-            if not chunk:
-                continue
+        try:
+            for kwargs in workers:
+                process = ctx.Process(target=_worker_process_target, args=(kwargs,))
+                process.start()
+                processes.append(process)
+            while any(process.is_alive() for process in processes):
+                for process in processes:
+                    process.join(timeout=0.1)
+                    if process.exitcode not in (None, 0):
+                        raise RuntimeError(
+                            f"Worker process {process.pid} failed with exit code {process.exitcode}"
+                        )
+            for process in processes:
+                if process.exitcode != 0:
+                    raise RuntimeError(
+                        f"Worker process {process.pid} failed with exit code {process.exitcode}"
+                    )
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in processes:
+                process.join()
 
-            # Protect against 64 KiB kernel pipe payload limit during mp.spawn
-            if len(chunk) > 1000:
-                ensure_directory(manifest_dir)
-                shard_manifest = os.path.join(manifest_dir, f"worker_{worker_id}.manifest")
-                with open(shard_manifest, "w", encoding="utf-8") as f:
-                    f.write("\n".join(chunk) + "\n")
-                files_payload = shard_manifest
-            else:
-                files_payload = chunk
+    def _verify_batch_completion(self, plan):
+        """A successful run must have a current completion record for every batch."""
+        for batch in plan["batches"]:
+            path = Path(self.output_path) / "metrics" / f"batch_{batch['batch_id']}.json"
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    record = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Missing completion record for batch {batch['batch_id']}") from exc
+            if (record.get("run_id") != plan["run_id"]
+                    or record.get("status") != "completed"
+                    or record.get("files") != batch["files"]
+                    or record.get("stages", {}).get("press", {}).get("structures") != batch["nfiles"]):
+                raise RuntimeError(f"Invalid completion record for batch {batch['batch_id']}")
 
-            device = self.devices[worker_id % len(self.devices)]
-            worker_kwargs = {
-                "files": files_payload,
-                "device": device,
-                "worker_id": worker_id,
-                "batch_size": self.batch_size,
-                "max_steps": self.max_steps,
-                "fmax": self.fmax,
-                "fmax1": self.fmax1,
-                "fmax2": self.fmax2,
-                "filter1": self.filter1,
-                "filter2": self.filter2,
-                "optimizer1": self.optimizer1,
-                "optimizer2": self.optimizer2,
-                "skip_second_stage": self.skip_second_stage,
-                "scalar_pressure": self.scalar_pressure,
-                "molecule_single": self.molecule_single,
-                "output_path": self.output_path,
-                "model": self.model,
-                "use_fasteq": self.use_fasteq,
-                "cueq": self.cueq,
-                "bfgs_cpu_thread": self.bfgs_cpu_thread,
-                "compile_mode": self.compile_mode,
-                "use_profiler": self.use_profiler,
-                "profiler_log_dir": self.profiler_log_dir,
-                "profiler_schedule_config": self.profiler_schedule_config,
-                **self.extra_kwargs,
+    def run(self) -> None:
+        """Plan complete batches, then execute queued or externally fixed work."""
+        self.files = list(self._candidate_files)
+        start_time = time.perf_counter()
+        run_id = uuid.uuid4().hex
+        self.run_id = run_id
+        ctx = mp.get_context("spawn")
+        batch_queue = None
+        manifest_dir = Path(self.output_path) / "manifests"
+        ensure_directory(manifest_dir)
+        plan_path = Path(self.output_path) / "batch_plan.json"
+
+        if self.fixed_batch_plan:
+            # External exact plans retain worker ownership and file order.
+            if self.num_structures:
+                self.files = select_structure_files(
+                    self.files, self.structure_order, self.structure_order_seed, self.num_structures)
+            assignments, worker_atoms, _ = self._load_fixed_batch_plan()
+            counts = {path: count_structure_atoms(path) for files in assignments for path in files}
+            plan = {
+                "mode": "exact-one-batch-per-worker",
+                "batch_mode": "fixed",
+                "source_plan": os.path.abspath(os.fspath(self.fixed_batch_plan)),
+                "num_files": len(self.files),
+                "num_workers": self.num_workers,
+                "num_batches": self.num_workers,
+                "batch_size_limit": self.batch_size,
+                "max_batch_atoms": self.max_batch_atoms,
+                "worker_atom_totals": worker_atoms,
+                "batches": [describe_batch(files, counts, worker_id, self.max_batch_atoms)
+                            for worker_id, files in enumerate(assignments)],
+                "workers": [{"worker_id": index, "num_batches": 1,
+                             "num_files": len(files), "atom_total": worker_atoms[index],
+                             "files": files} for index, files in enumerate(assignments)],
             }
-            if self.cpu_masks is not None:
-                worker_kwargs["affinity_cores"] = self.cpu_masks[worker_id]
-
-            ctx = mp.get_context("spawn")
-            p = ctx.Process(target=_worker_process_target, args=(worker_kwargs,))
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
+            workers = []
+            for worker_id, files in enumerate(assignments):
+                # Preserve the existing manifests while keeping spawn payloads small.
+                with (manifest_dir / f"worker_{worker_id}.batches.json").open("w", encoding="utf-8") as handle:
+                    json.dump([files], handle, indent=2)
+                payload = files
+                if len(files) > 1000:
+                    shard = manifest_dir / f"worker_{worker_id}.manifest"
+                    shard.write_text("\n".join(files) + "\n", encoding="utf-8")
+                    payload = str(shard)
+                workers.append(self._worker_kwargs(
+                    worker_id, payload, fixed_one_batch=True, run_id=run_id,
+                    batch_plan_path=str(plan_path),
+                ))
+        else:
+            plan, cache_report = load_or_build_batch_plan(
+                self.files, self.batch_mode, self.batch_size, self.max_batch_atoms,
+                self.structure_order, self.structure_order_seed,
+                cache_dir=self.batch_plan_cache_dir,
+                cache_limit=self.batch_plan_cache_limit,
+                num_structures=self.num_structures,
+            )
+            plan["planning_cache"] = cache_report
+            logger.info("Batch plan cache %s: %s (planning %.3fs)",
+                        cache_report["status"], cache_report["path"] or "-",
+                        cache_report["elapsed_s"])
+            self.files = plan["ordered_files"]
+            active_workers = min(self.num_workers, plan["num_batches"])
+            plan["num_workers"] = self.num_workers
+            plan["active_workers"] = active_workers
+            if active_workers:
+                batch_queue = ctx.Queue()
+                # Queue only IDs: CIF data and graph tensors stay out of IPC.
+                for batch in plan["batches"]:
+                    batch_queue.put(batch["batch_id"])
+                for _ in range(active_workers):
+                    batch_queue.put(None)
+            workers = [self._worker_kwargs(
+                worker_id, [], batch_queue=batch_queue, batch_plan_path=str(plan_path),
+                run_id=run_id,
+            ) for worker_id in range(active_workers)]
+        plan["run_id"] = run_id
+        with plan_path.open("w", encoding="utf-8") as handle:
+            json.dump(plan, handle, indent=2)
+        (Path(self.output_path) / "manifest.txt").write_text(
+            "\n".join(self.files) + ("\n" if self.files else ""), encoding="utf-8",
+        )
+        logger.info(
+            f"Batch plan: mode={plan['batch_mode']}, files={len(self.files)}, "
+            f"batches={plan['num_batches']}, active_workers={len(workers)}; "
+            f"devices={self.devices}."
+        )
+        try:
+            self._execute_workers(ctx, workers)
+            self._verify_batch_completion(plan)
+        finally:
+            if batch_queue is not None:
+                # A crashed worker may leave unread tasks; never wait for the
+                # feeder to flush those tasks into a pipe with no readers.
+                batch_queue.cancel_join_thread()
+                batch_queue.close()
 
         self._write_summary_csv()
-
         elapsed = time.perf_counter() - start_time
         self._print_dashboard(elapsed)
-
         summary_csv = os.path.join(self.output_path, "summary_scheduler.csv")
-        try:
-            with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-                f.write("elapsed_time,num_workers,batch_size\n")
-                f.write(f"{elapsed},{self.num_workers},{self.batch_size}\n")
-        except Exception as e:
-            logger.warning(f"Failed to write summary_scheduler.csv: {e}")
-        logger.info(f"All worker processes completed. Total elapsed time: {elapsed:.2f}s")
+        with open(summary_csv, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["elapsed_time", "num_workers", "batch_size"])
+            writer.writerow([elapsed, self.num_workers, self.batch_size])
+        logger.info(f"All batches completed. Total elapsed time: {elapsed:.2f}s")
 
     def _write_summary_csv(self) -> None:
         """Aggregate per-structure JSON records into results_scheduler.csv."""
@@ -576,7 +749,9 @@ class Scheduler:
         for wf in worker_files:
             try:
                 with open(wf, "r", encoding="utf-8") as f:
-                    worker_data.append(json.load(f))
+                    record = json.load(f)
+                if getattr(self, "run_id", None) is None or record.get("run_id") == self.run_id:
+                    worker_data.append(record)
             except Exception as e:
                 logger.warning(f"Failed to read metric file {wf}: {e}")
 
@@ -666,7 +841,8 @@ class Scheduler:
             ])
         lines.extend([
             f" Cluster Throughput: {cluster_struct_rate:.1f} struct-steps/s ({structs_per_min:.1f} structs/min)",
-            f" Active Devices    : {self.devices} ({self.num_workers} workers, batch_size={self.batch_size})",
+            f" Active Devices    : {self.devices} ({len(worker_data)} active workers)",
+            f" Batch Planning    : {'fixed' if self.fixed_batch_plan else self.batch_mode}",
         ])
         lines.extend(self._build_final_structure_summary(records, has_stage2))
         lines.extend(["-" * 96])
@@ -680,7 +856,7 @@ class Scheduler:
                 f"{c_s1}{s1_opt:>8.1f}s               -            {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
                 f"   └─ S2: {self.optimizer2}{(' + Cell' if 'Cell' in str(self.filter2) else f' + {self.filter2}') if self.filter2 else ''}"[:31].ljust(31) + f"      -          {s2_opt:>8.1f}s           {s2_opt:>8.1f}s        {s2_opt_pct:>5.1f}%",
                 f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s        {s2_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
-                f" Replenish & I/O               {s1_io:>8.1f}s        {s2_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
+                f" Data & I/O                    {s1_io:>8.1f}s        {s2_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
                 "-" * 96,
                 f" Total Active Worker Time      {s1_total_time:>8.1f}s        {s2_total_time:>8.1f}s          {total_worker_time:>8.1f}s       100.0%",
                 "-" * 96,
@@ -695,7 +871,7 @@ class Scheduler:
                 f"{c_opt}{s1_opt:>8.1f}s          {total_opt:>8.1f}s        {opt_pct:>5.1f}%",
                 f"{c_s1}{s1_opt:>8.1f}s          {s1_opt:>8.1f}s        {s1_opt_pct:>5.1f}%",
                 f" Neighbor Graph (PBC)          {s1_graph:>8.1f}s          {total_graph:>8.1f}s        {graph_pct:>5.1f}%",
-                f" Replenish & I/O               {s1_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
+                f" Data & I/O                    {s1_io:>8.1f}s          {total_io:>8.1f}s        {io_pct:>5.1f}%",
                 "-" * 96,
                 f" Total Active Worker Time      {s1_total_time:>8.1f}s          {total_worker_time:>8.1f}s       100.0%",
                 "-" * 96,
