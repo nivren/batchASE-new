@@ -54,7 +54,8 @@ class MACEBatchBackend:
 
     def __init__(
         self,
-        model: str = "small",
+        model: Optional[str] = None,
+        loader: str = "off",
         device: str = "cuda",
         default_dtype: str = "float64",
         enable_cueq: bool = False,
@@ -66,6 +67,7 @@ class MACEBatchBackend:
         **mace_kwargs,
     ):
         self.kind = "mace"
+        self.loader_hint = loader
         self.neighbor = neighbor
         self.default_dtype = default_dtype
         self.dtype = torch.float64 if default_dtype == "float64" else torch.float32
@@ -83,12 +85,12 @@ class MACEBatchBackend:
             self.cuet_fasteq_active = False
 
         if calculator is None:
-            from mace.calculators import mace_off
-            # Device passed to mace_off must be "cuda" without index for conv_fusion=(device=="cuda")
+            loader_fn, model_value = self._resolve_mace_loader(loader, model)
+            # Device passed to the mace loaders must be "cuda" without index for conv_fusion=(device=="cuda")
             _mace_dev = str(device).split(":")[0] if str(device).startswith("cuda") else str(device)
             try:
-                calculator = mace_off(
-                    model=model,
+                calculator = loader_fn(
+                    model=model_value,
                     device=_mace_dev,
                     default_dtype=default_dtype,
                     enable_cueq=enable_cueq,
@@ -104,8 +106,8 @@ class MACEBatchBackend:
                     )
                     self.use_compile = False
                     self.compile_mode = None
-                    calculator = mace_off(
-                        model=model,
+                    calculator = loader_fn(
+                        model=model_value,
                         device=_mace_dev,
                         default_dtype=default_dtype,
                         enable_cueq=enable_cueq,
@@ -136,6 +138,28 @@ class MACEBatchBackend:
             use_fasteq,
             self.compile_mode,
         )
+
+    @staticmethod
+    def _resolve_mace_loader(loader: str, model: Optional[str]):
+        """Map (loader hint, model spec) to (mace loader function, model value).
+
+        - "off": MACE-OFF23 family (organic elements only). model None keeps the
+          legacy batchASE default "small".
+        - "mp": MACE-MP family (89 elements incl. Li). model None uses the mace_mp
+          default (mace-mpa-0-medium, bundled with mace>=0.3.16 / cached).
+
+        Function-level imports keep ``unittest.mock.patch("mace.calculators.mace_off", ...)``
+        style patching effective in tests.
+        """
+        if loader == "mp":
+            from mace.calculators import mace_mp
+
+            return mace_mp, model
+        if loader == "off":
+            from mace.calculators import mace_off
+
+            return mace_off, ("small" if model is None else str(model))
+        raise ValueError(f"Unknown MACE loader hint: '{loader}' (expected 'off' or 'mp')")
 
     def _run_neighbor_kernel(self, pos, cell, natoms, atomic_numbers, batch, ptr):
         gbatch = _GraphView(
